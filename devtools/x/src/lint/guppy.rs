@@ -5,7 +5,7 @@
 
 use crate::config::{BannedDepsConfig, EnforcedAttributesConfig, OverlayConfig};
 use anyhow::anyhow;
-use guppy::{graph::feature::FeatureFilterFn, Version};
+use guppy::{graph::feature::FeatureFilterFn, Version, VersionReq};
 use hakari::summaries::HakariBuilderSummary;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -158,15 +158,11 @@ impl PackageLinter for CrateNamesPaths {
         }
 
         let workspace_path = ctx.workspace_path();
-        if let Some(path) = workspace_path.to_str() {
-            if path.contains('_') {
-                out.write(
-                    LintLevel::Error,
-                    "workspace path contains '_' (use '-' instead)",
-                );
-            }
-        } else {
-            // Workspace path is invalid UTF-8. A different lint should catch this.
+        if workspace_path.as_str().contains('_') {
+            out.write(
+                LintLevel::Error,
+                "workspace path contains '_' (use '-' instead)",
+            );
         }
 
         for build_target in ctx.metadata().build_targets() {
@@ -383,4 +379,131 @@ impl<'cfg> PackageLinter for OverlayFeatures<'cfg> {
 
 fn feature_str(feature: Option<&str>) -> &str {
     feature.unwrap_or("[base]")
+}
+
+/// Ensure that all unpublished packages only use path dependencies for workspace dependencies
+#[derive(Debug)]
+pub struct UnpublishedPackagesOnlyUsePathDependencies {
+    no_version_req: VersionReq,
+}
+
+impl UnpublishedPackagesOnlyUsePathDependencies {
+    pub fn new() -> Self {
+        Self {
+            no_version_req: VersionReq::parse(">=0.0.0").expect(">=0.0.0 should be a valid req"),
+        }
+    }
+}
+
+impl Linter for UnpublishedPackagesOnlyUsePathDependencies {
+    fn name(&self) -> &'static str {
+        "unpublished-packages-only-use-path-dependencies"
+    }
+}
+
+impl PackageLinter for UnpublishedPackagesOnlyUsePathDependencies {
+    fn run<'l>(
+        &self,
+        ctx: &PackageContext<'l>,
+        out: &mut LintFormatter<'l, '_>,
+    ) -> Result<RunStatus<'l>> {
+        let metadata = ctx.metadata();
+
+        // Skip all packages which aren't 'publish = false'
+        if !matches!(metadata.publish(), Some(&[])) {
+            return Ok(RunStatus::Executed);
+        }
+
+        for direct_dep in metadata.direct_links().filter(|p| p.to().in_workspace()) {
+            if direct_dep.version_req() != &self.no_version_req {
+                let msg = format!(
+                    "unpublished package specifies a version of first-party dependency '{}'; \
+                    unpublished packages should only use path dependencies for first-party packages.",
+                    direct_dep.dep_name(),
+                );
+                out.write(LintLevel::Error, msg);
+            }
+        }
+
+        Ok(RunStatus::Executed)
+    }
+}
+
+/// Ensure that all published packages only depend on other, published packages
+#[derive(Debug)]
+pub struct PublishedPackagesDontDependOnUnpublishedPackages;
+
+impl Linter for PublishedPackagesDontDependOnUnpublishedPackages {
+    fn name(&self) -> &'static str {
+        "published-packages-dont-depend-on-unpublished-packages"
+    }
+}
+
+impl PackageLinter for PublishedPackagesDontDependOnUnpublishedPackages {
+    fn run<'l>(
+        &self,
+        ctx: &PackageContext<'l>,
+        out: &mut LintFormatter<'l, '_>,
+    ) -> Result<RunStatus<'l>> {
+        let metadata = ctx.metadata();
+
+        // Skip all packages which aren't publishable
+        if matches!(metadata.publish(), Some(&[])) {
+            return Ok(RunStatus::Executed);
+        }
+
+        for direct_dep in metadata
+            .direct_links()
+            .filter(|p| !p.dev_only() && p.to().in_workspace())
+        {
+            // If the direct dependency isn't publishable
+            if matches!(direct_dep.to().publish(), Some(&[])) {
+                out.write(
+                    LintLevel::Error,
+                    format!(
+                        "published package can't depend on unpublished package '{}'",
+                        direct_dep.dep_name()
+                    ),
+                );
+            }
+        }
+
+        Ok(RunStatus::Executed)
+    }
+}
+
+/// Only allow crates to be published to crates.io
+#[derive(Debug)]
+pub struct OnlyPublishToCratesIo;
+
+impl Linter for OnlyPublishToCratesIo {
+    fn name(&self) -> &'static str {
+        "only-publish-to-crates-io"
+    }
+}
+
+impl PackageLinter for OnlyPublishToCratesIo {
+    fn run<'l>(
+        &self,
+        ctx: &PackageContext<'l>,
+        out: &mut LintFormatter<'l, '_>,
+    ) -> Result<RunStatus<'l>> {
+        let metadata = ctx.metadata();
+
+        match metadata.publish() {
+            Some(&[]) => {}
+            Some(&[ref r]) if r == "crates-io" => {}
+            _ => {
+                out.write(
+                    LintLevel::Error,
+                    "published package should only be publishable to crates.io. \
+                        If you intend to publish this package, ensure the 'publish' \
+                        field in the package's Cargo.toml is 'publish = [\"crates-io\"]. \
+                        Otherwise set the 'publish' field to 'publish = false'.",
+                );
+            }
+        }
+
+        Ok(RunStatus::Executed)
+    }
 }

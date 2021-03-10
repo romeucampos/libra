@@ -62,6 +62,8 @@ pub enum InvalidTxType {
     Sender,
     /// invalid tx with receiver not on chain
     Receiver,
+    /// duplicate an exist tx
+    Duplication,
     /// Last element of enum, please add new case above
     MaxValue,
 }
@@ -71,7 +73,6 @@ pub struct TxEmitter {
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
     chain_id: ChainId,
     vasp: bool,
-    invalid_tx: u64,
 }
 
 pub struct EmitJob {
@@ -129,6 +130,7 @@ pub struct EmitJobRequest {
     pub workers_per_ac: Option<usize>,
     pub thread_params: EmitThreadParams,
     pub gas_price: u64,
+    pub invalid_tx: u64,
 }
 
 pub static REUSE_ACC: Lazy<bool> = Lazy::new(|| env::var("REUSE_ACC").is_ok());
@@ -138,14 +140,16 @@ impl EmitJobRequest {
         instances: Vec<Instance>,
         global_emit_job_request: &Option<EmitJobRequest>,
         gas_price: u64,
+        invalid_tx: u64,
     ) -> Self {
-        match global_emit_job_request {
+        let mut req = match global_emit_job_request {
             Some(global_emit_job_request) => EmitJobRequest {
                 instances,
                 accounts_per_client: global_emit_job_request.accounts_per_client,
                 workers_per_ac: global_emit_job_request.workers_per_ac,
                 thread_params: global_emit_job_request.thread_params.clone(),
                 gas_price,
+                invalid_tx,
             },
             None => Self {
                 instances,
@@ -153,8 +157,13 @@ impl EmitJobRequest {
                 workers_per_ac: None,
                 thread_params: EmitThreadParams::default(),
                 gas_price,
+                invalid_tx,
             },
+        };
+        if invalid_tx != 0 {
+            req.thread_params.wait_committed = false;
         }
+        req
     }
 
     pub fn fixed_tps_params(instance_count: usize, tps: u64) -> (usize, u64) {
@@ -166,7 +175,7 @@ impl EmitJobRequest {
         (num_workers, wait_time)
     }
 
-    pub fn fixed_tps(instances: Vec<Instance>, tps: u64, gas_price: u64) -> Self {
+    pub fn fixed_tps(instances: Vec<Instance>, tps: u64, gas_price: u64, invalid_tx: u64) -> Self {
         let (num_workers, wait_time) = EmitJobRequest::fixed_tps_params(instances.len(), tps);
         Self {
             instances,
@@ -174,21 +183,21 @@ impl EmitJobRequest {
             workers_per_ac: Some(num_workers),
             thread_params: EmitThreadParams {
                 wait_millis: wait_time,
-                wait_committed: true,
+                wait_committed: invalid_tx == 0,
             },
             gas_price,
+            invalid_tx,
         }
     }
 }
 
 impl TxEmitter {
-    pub fn new(cluster: &Cluster, vasp: bool, invalid_tx: u64) -> Self {
+    pub fn new(cluster: &Cluster, vasp: bool) -> Self {
         Self {
             accounts: vec![],
             mint_key_pair: cluster.mint_key_pair().clone(),
             chain_id: cluster.chain_id,
             vasp,
-            invalid_tx,
         }
     }
 
@@ -287,7 +296,7 @@ impl TxEmitter {
                     params,
                     stats,
                     chain_id: self.chain_id,
-                    invalid_tx: self.invalid_tx,
+                    invalid_tx: req.invalid_tx,
                 };
                 let join_handle = tokio_handle.spawn(worker.run(req.gas_price).boxed());
                 workers.push(Worker { join_handle });
@@ -619,10 +628,11 @@ struct SubmissionWorker {
 
 fn get_invalid_type() -> InvalidTxType {
     let mut rng = rand::thread_rng();
-    match rng.gen_range(0, InvalidTxType::MaxValue as usize) {
+    match rng.gen_range(0..InvalidTxType::MaxValue as usize) {
         1 => InvalidTxType::Receiver,
         2 => InvalidTxType::Sender,
-        _ => InvalidTxType::ChainId,
+        3 => InvalidTxType::ChainId,
+        _ => InvalidTxType::Duplication,
     }
 }
 
@@ -631,11 +641,12 @@ fn invalid_tx(
     receiver: &AccountAddress,
     chain_id: ChainId,
     gas_price: u64,
+    reqs: &[SignedTransaction],
 ) -> SignedTransaction {
     let seed: [u8; 32] = OsRng.gen();
     let mut rng = StdRng::from_seed(seed);
     let mut invalid_account = gen_random_account(&mut rng);
-    let invalid_address = gen_random_account(&mut rng).address;
+    let invalid_address = invalid_account.address;
     match get_invalid_type() {
         InvalidTxType::Receiver => {
             gen_transfer_txn_request(sender, &invalid_address, SEND_AMOUNT, chain_id, gas_price)
@@ -649,6 +660,22 @@ fn invalid_tx(
         ),
         InvalidTxType::ChainId => {
             gen_transfer_txn_request(sender, receiver, SEND_AMOUNT, ChainId::new(255), gas_price)
+        }
+        InvalidTxType::Duplication => {
+            // if this is the first tx, default to generate invalid tx with wrong chain id
+            // otherwise, make a duplication of an exist valid tx
+            if reqs.is_empty() {
+                gen_transfer_txn_request(
+                    sender,
+                    receiver,
+                    SEND_AMOUNT,
+                    ChainId::new(255),
+                    gas_price,
+                )
+            } else {
+                let random_index = rng.gen_range(0..reqs.len() as usize);
+                reqs[random_index].clone()
+            }
         }
         _ => panic!("wrong invalid type"),
     }
@@ -732,22 +759,19 @@ impl SubmissionWorker {
             .iter_mut()
             .choose_multiple(&mut rng, batch_size);
         let mut requests = Vec::with_capacity(accounts.len());
-        let mut invalid_size = if self.invalid_tx != 0 {
+        let invalid_size = if self.invalid_tx != 0 {
             // if enable mix invalid tx, at least 1 invalid tx per batch
             max(1, accounts.len() * self.invalid_tx as usize / 100)
         } else {
             0
         };
+        let mut num_valid_tx = accounts.len() - invalid_size;
         for sender in accounts {
             let receiver = self
                 .all_addresses
                 .choose(&mut rng)
                 .expect("all_addresses can't be empty");
-            if invalid_size > 0 {
-                let request = invalid_tx(sender, receiver, self.chain_id, gas_price);
-                requests.push(request);
-                invalid_size -= 1;
-            } else {
+            if num_valid_tx > 0 {
                 let request = gen_transfer_txn_request(
                     sender,
                     receiver,
@@ -755,6 +779,10 @@ impl SubmissionWorker {
                     self.chain_id,
                     gas_price,
                 );
+                requests.push(request);
+                num_valid_tx -= 1;
+            } else {
+                let request = invalid_tx(sender, receiver, self.chain_id, gas_price, &requests);
                 requests.push(request);
             }
         }

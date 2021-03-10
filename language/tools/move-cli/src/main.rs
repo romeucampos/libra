@@ -9,14 +9,15 @@ use move_cli::{
 };
 use move_core_types::{
     account_address::AccountAddress,
+    effects::{ChangeSet, Event},
     gas_schedule::{GasAlgebra, GasUnits},
-    language_storage::TypeTag,
+    language_storage::{ModuleId, TypeTag},
     parser,
     transaction_argument::{convert_txn_args, TransactionArgument},
     vm_status::{AbortLocation, StatusCode, VMStatus},
 };
 use move_lang::{self, compiled_unit::CompiledUnit};
-use move_vm_runtime::{data_cache::TransactionEffects, logging::NoContextLog, move_vm::MoveVM};
+use move_vm_runtime::{logging::NoContextLog, move_vm::MoveVM};
 use move_vm_types::gas_schedule::CostStrategy;
 use vm::{
     access::{ModuleAccess, ScriptAccess},
@@ -237,7 +238,7 @@ fn publish(
 
     let num_modules = compiled_units
         .iter()
-        .filter(|u| matches!(u,  CompiledUnit::Module {..}))
+        .filter(|u| matches!(u, CompiledUnit::Module { .. }))
         .count();
     if verbose {
         println!("Found and compiled {} modules", num_modules)
@@ -284,11 +285,16 @@ fn publish(
         }
 
         if !has_error {
-            let effects = session.finish().map_err(|e| e.into_vm_status())?;
+            let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
+            assert!(events.is_empty());
             if verbose {
-                explain_publish_effects(&effects, &state)?
+                explain_publish_changeset(&changeset, &state);
             }
-            state.save_modules(&effects.modules)?;
+            let modules: Vec<_> = changeset
+                .into_modules()
+                .map(|(module_id, blob_opt)| (module_id, blob_opt.expect("must be non-deletion")))
+                .collect();
+            state.save_modules(&modules)?;
         }
     } else {
         // NOTE: the VM enforces the most strict way of module republishing and does not allow
@@ -395,11 +401,11 @@ fn run(
             txn_args,
         )
     } else {
-        let effects = session.finish().map_err(|e| e.into_vm_status())?;
+        let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
         if verbose {
-            explain_execution_effects(&effects, &state)?
+            explain_execution_effects(&changeset, &events, &state)?
         }
-        maybe_commit_effects(!dry_run, effects, &state)
+        maybe_commit_effects(!dry_run, changeset, events, &state)
     }
 }
 
@@ -420,102 +426,136 @@ fn get_cost_strategy(gas_budget: Option<u64>) -> Result<CostStrategy<'static>> {
     Ok(cost_strategy)
 }
 
-fn explain_publish_effects(effects: &TransactionEffects, state: &OnDiskStateView) -> Result<()> {
-    // publish effects should contain no events and resources
-    assert!(effects.events.is_empty());
-    assert!(effects.resources.is_empty());
-    for (module_id, _) in &effects.modules {
-        if state.has_module(module_id) {
-            println!("Updating an existing module {}", module_id);
+fn explain_publish_changeset(changeset: &ChangeSet, state: &OnDiskStateView) {
+    // publish effects should contain no resources
+    assert!(changeset.resources().next().is_none());
+    // total bytes written across all accounts
+    let mut total_bytes_written = 0;
+    for (addr, name, blob_opt) in changeset.modules() {
+        if let Some(module_bytes) = blob_opt {
+            let bytes_written = addr.len() + name.len() + module_bytes.len();
+            total_bytes_written += bytes_written;
+            let module_id = ModuleId::new(addr, name.clone());
+            if state.has_module(&module_id) {
+                println!(
+                    "Updating an existing module {} (wrote {:?} bytes)",
+                    module_id, bytes_written
+                );
+            } else {
+                println!(
+                    "Publishing a new module {} (wrote {:?} bytes)",
+                    module_id, bytes_written
+                );
+            }
         } else {
-            println!("Publishing a new module {}", module_id);
+            panic!("Deleting a module is not supported")
         }
     }
-    Ok(())
+    println!(
+        "Wrote {:?} bytes of module ID's and code",
+        total_bytes_written
+    )
 }
 
-fn explain_execution_effects(effects: &TransactionEffects, state: &OnDiskStateView) -> Result<()> {
+fn explain_execution_effects(
+    changeset: &ChangeSet,
+    events: &[Event],
+    state: &OnDiskStateView,
+) -> Result<()> {
     // execution effects should contain no modules
-    assert!(effects.modules.is_empty());
-    if !effects.events.is_empty() {
-        println!("Emitted {:?} events:", effects.events.len());
+    assert!(changeset.modules().next().is_none());
+    if !events.is_empty() {
+        println!("Emitted {:?} events:", events.len());
         // TODO: better event printing
-        for (event_key, event_sequence_number, _event_type, _event_layout, event_data) in
-            &effects.events
-        {
+        for (event_key, event_sequence_number, _event_type, event_data) in events {
             println!(
                 "Emitted {:?} as the {}th event to stream {:?}",
                 event_data, event_sequence_number, event_key
             )
         }
     }
-    if !effects.resources.is_empty() {
+    if !changeset.accounts.is_empty() {
         println!(
             "Changed resource(s) under {:?} address(es):",
-            effects.resources.len()
+            changeset.accounts.len()
         );
     }
-    for (addr, writes) in &effects.resources {
+    // total bytes written across all accounts
+    let mut total_bytes_written = 0;
+    for (addr, account) in &changeset.accounts {
         print!("  ");
+        if account.resources.is_empty() {
+            continue;
+        }
         println!(
             "Changed {:?} resource(s) under address {:?}:",
-            writes.len(),
+            account.resources.len(),
             addr
         );
-        for (struct_tag, write_opt) in writes {
+        for (struct_tag, write_opt) in &account.resources {
             print!("    ");
+            let mut bytes_to_write = struct_tag.access_vector().len();
             match write_opt {
-                Some((_layout, value)) => {
+                Some(blob) => {
+                    bytes_to_write += blob.len();
                     if state
                         .get_resource_bytes(*addr, struct_tag.clone())?
                         .is_some()
                     {
                         // TODO: print resource diff
-                        println!("Changed type {}: {}", struct_tag, value)
+                        println!(
+                            "Changed type {}: {:?} (wrote {:?} bytes)",
+                            struct_tag, blob, bytes_to_write
+                        )
                     } else {
                         // TODO: nicer printing
-                        println!("Added type {}: {}", struct_tag, value)
+                        println!(
+                            "Added type {}: {:?} (wrote {:?} bytes)",
+                            struct_tag, blob, bytes_to_write
+                        )
                     }
                 }
-                None => println!("Deleted type {}", struct_tag),
-            }
+                None => println!(
+                    "Deleted type {} (wrote {:?} bytes)",
+                    struct_tag, bytes_to_write
+                ),
+            };
+            total_bytes_written += bytes_to_write;
         }
     }
+    if total_bytes_written != 0 {
+        println!(
+            "Wrote {:?} bytes of resource ID's and data",
+            total_bytes_written
+        );
+    }
+
     Ok(())
 }
 
 /// Commit the resources and events modified by a transaction to disk
 fn maybe_commit_effects(
     commit: bool,
-    effects: TransactionEffects,
+    changeset: ChangeSet,
+    events: Vec<Event>,
     state: &OnDiskStateView,
 ) -> Result<()> {
     // similar to explain effects, all module publishing happens via save_modules(), so effects
     // shouldn't contain modules
     if commit {
-        for (addr, writes) in effects.resources {
-            for (struct_tag, write_opt) in writes {
-                match write_opt {
-                    Some((layout, value)) => {
-                        state.save_resource(addr, struct_tag, layout, value)?
-                    }
+        for (addr, account) in changeset.accounts {
+            for (struct_tag, blob_opt) in account.resources {
+                match blob_opt {
+                    Some(blob) => state.save_resource(addr, struct_tag, &blob)?,
                     None => state.delete_resource(addr, struct_tag)?,
                 }
             }
         }
 
-        for (event_key, event_sequence_number, event_type, event_layout, event_data) in
-            effects.events
-        {
-            state.save_event(
-                &event_key,
-                event_sequence_number,
-                event_type,
-                &event_layout,
-                event_data,
-            )?
+        for (event_key, event_sequence_number, event_type, event_data) in events {
+            state.save_event(&event_key, event_sequence_number, event_type, event_data)?
         }
-    } else if !(effects.resources.is_empty() && effects.events.is_empty()) {
+    } else if !(changeset.resources().next().is_none() && events.is_empty()) {
         println!("Discarding changes; re-run without --dry-run if you would like to keep them.")
     }
 
@@ -610,7 +650,7 @@ fn explain_publish_error(
             let mut stack = vec![];
             let mut state = BTreeMap::new();
             state.insert(module_id.clone(), true);
-            for dep in module.immediate_module_dependencies() {
+            for dep in module.immediate_dependencies() {
                 stack.push((code_cache.get_module(&dep)?, false));
             }
 
@@ -622,7 +662,7 @@ fn explain_publish_error(
                 } else {
                     state.insert(cur_id, true);
                     stack.push((cur, true));
-                    for next in cur.immediate_module_dependencies() {
+                    for next in cur.immediate_dependencies() {
                         if let Some(is_discovered_but_not_finished) = state.get(&next) {
                             if *is_discovered_but_not_finished {
                                 let cycle_path: Vec<_> = stack
@@ -813,13 +853,21 @@ fn doctor(state: OnDiskStateView) -> Result<()> {
             )
         }
 
-        let cyclic_check_result =
-            bytecode_verifier::cyclic_dependencies::verify_module(module, |module_id| {
+        let cyclic_check_result = bytecode_verifier::cyclic_dependencies::verify_module(
+            module,
+            |module_id| {
                 code_cache
                     .get_module(module_id)
                     .map_err(|_| PartialVMError::new(StatusCode::MISSING_DEPENDENCY))
-                    .map(|m| m.immediate_module_dependencies())
-            });
+                    .map(|m| m.immediate_dependencies())
+            },
+            |module_id| {
+                code_cache
+                    .get_module(module_id)
+                    .map_err(|_| PartialVMError::new(StatusCode::MISSING_DEPENDENCY))
+                    .map(|m| m.immediate_friends())
+            },
+        );
         if let Err(cyclic_check_error) = cyclic_check_result {
             // the only possible error in the CLI's context is CYCLIC_MODULE_DEPENDENCY
             assert_eq!(

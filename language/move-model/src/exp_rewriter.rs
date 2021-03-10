@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::{
-    ast::{Exp, TempIndex},
+    ast::{Exp, LocalVarDecl, TempIndex},
     model::{GlobalEnv, NodeId},
     symbol::Symbol,
     ty::Type,
@@ -67,27 +67,25 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
                 self.rewrite_vec(args),
             ),
             Lambda(id, vars, body) => {
+                let vars = self.rewrite_decls(vars);
                 self.shadowed
                     .push_front(vars.iter().map(|decl| decl.name).collect());
-                let res = Lambda(
-                    self.rewrite_attrs(*id),
-                    vars.clone(),
-                    Box::new(self.rewrite(body)),
-                );
+                let res = Lambda(self.rewrite_attrs(*id), vars, Box::new(self.rewrite(body)));
                 self.shadowed.pop_front();
                 res
             }
-            Quant(id, kind, ranges, condition, body) => {
-                let ranges = ranges
-                    .iter()
-                    .map(|(decl, range)| (decl.clone(), self.rewrite(range)))
-                    .collect_vec();
+            Quant(id, kind, ranges, triggers, condition, body) => {
+                let ranges = self.rewrite_quant_decls(ranges);
                 self.shadowed
                     .push_front(ranges.iter().map(|(decl, _)| decl.name).collect());
                 let res = Quant(
                     self.rewrite_attrs(*id),
                     *kind,
                     ranges,
+                    triggers
+                        .iter()
+                        .map(|trigger| trigger.iter().map(|exp| self.rewrite(&*exp)).collect())
+                        .collect(),
                     condition.as_ref().map(|exp| Box::new(self.rewrite(&*exp))),
                     Box::new(self.rewrite(body)),
                 );
@@ -95,13 +93,10 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
                 res
             }
             Block(id, vars, body) => {
+                let vars = self.rewrite_decls(vars);
                 self.shadowed
                     .push_front(vars.iter().map(|decl| decl.name).collect());
-                let res = Block(
-                    self.rewrite_attrs(*id),
-                    vars.clone(),
-                    Box::new(self.rewrite(body)),
-                );
+                let res = Block(self.rewrite_attrs(*id), vars, Box::new(self.rewrite(body)));
                 self.shadowed.pop_front();
                 res
             }
@@ -113,6 +108,33 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
             ),
             Invalid(..) | Value(..) | SpecVar(..) => exp.clone(),
         }
+    }
+
+    fn rewrite_decls(&mut self, decls: &[LocalVarDecl]) -> Vec<LocalVarDecl> {
+        decls
+            .iter()
+            .map(|d| LocalVarDecl {
+                id: self.rewrite_attrs(d.id),
+                name: d.name,
+                binding: d.binding.as_ref().map(|e| self.rewrite(e)),
+            })
+            .collect()
+    }
+
+    fn rewrite_quant_decls(&mut self, decls: &[(LocalVarDecl, Exp)]) -> Vec<(LocalVarDecl, Exp)> {
+        decls
+            .iter()
+            .map(|(d, e)| {
+                (
+                    LocalVarDecl {
+                        id: self.rewrite_attrs(d.id),
+                        name: d.name,
+                        binding: d.binding.as_ref().map(|e| self.rewrite(e)),
+                    },
+                    self.rewrite(e),
+                )
+            })
+            .collect()
     }
 
     fn replace_local(&mut self, node_id: NodeId, sym: Symbol) -> Exp {
@@ -140,8 +162,6 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
     }
 
     pub fn rewrite_vec(&mut self, exps: &[Exp]) -> Vec<Exp> {
-        // For some reason, we don't get the lifetime right when we use a map. Figure out
-        // why and remove this explicit treatment.
         let mut res = vec![];
         for exp in exps {
             res.push(self.rewrite(exp));

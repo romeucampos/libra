@@ -55,6 +55,7 @@ impl MetadataCacheOpt {
 pub async fn sync_and_load(
     opt: &MetadataCacheOpt,
     storage: Arc<dyn BackupStorage>,
+    concurrent_downloads: usize,
 ) -> Result<MetadataView> {
     let timer = Instant::now();
     let cache_dir = opt.cache_dir();
@@ -110,6 +111,8 @@ pub async fn sync_and_load(
         async move {
             let file_handle = fh_by_h_ref.get(*h).expect("In map.");
             let local_file = cache_dir_ref.join(*h);
+            let local_tmp_file = cache_dir_ref.join(format!(".{}", *h));
+            // download to tmp file ".xxxxxx"
             tokio::io::copy(
                 &mut storage_ref
                     .open_for_read(file_handle)
@@ -118,19 +121,22 @@ pub async fn sync_and_load(
                 &mut OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(&local_file)
+                    .open(&local_tmp_file)
                     .await
                     .err_notes(&local_file)?,
             )
             .await?;
+            // rename to target file only if successful; stale tmp file caused by failure will be
+            // reclaimed on next run
+            tokio::fs::rename(local_tmp_file, local_file).await?;
             NUM_META_DOWNLOAD.inc();
             Ok(())
         }
     });
     futures::stream::iter(futs)
         .buffered_x(
-            num_cpus::get() * 2, /* buffer size */
-            num_cpus::get(),     /* concurrency */
+            concurrent_downloads * 2, /* buffer size */
+            concurrent_downloads,     /* concurrency */
         )
         .collect::<Result<Vec<_>>>()
         .await?;

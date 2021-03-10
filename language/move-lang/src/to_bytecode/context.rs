@@ -4,9 +4,7 @@
 use crate::{
     expansion::ast::SpecId,
     hlir::ast as H,
-    parser::ast::{
-        ConstantName, FunctionName, ModuleIdent, ModuleIdent_, ModuleName, StructName, Var,
-    },
+    parser::ast::{ConstantName, FunctionName, ModuleIdent, StructName, Var},
 };
 use diem_types::account_address::AccountAddress as DiemAddress;
 use move_ir_types::ast as IR;
@@ -14,6 +12,7 @@ use std::{
     clone::Clone,
     collections::{BTreeMap, BTreeSet, HashMap},
 };
+use IR::Ability;
 
 /// Compilation context for a single compilation unit (module or script).
 /// Contains all of the dependencies actually used in the module
@@ -60,7 +59,10 @@ impl<'a> Context<'a> {
         dependency_orderings: &HashMap<ModuleIdent, usize>,
         struct_declarations: &HashMap<
             (ModuleIdent, StructName),
-            (bool, Vec<(IR::TypeVar, IR::Kind)>),
+            (
+                BTreeSet<IR::Ability>,
+                Vec<(IR::TypeVar, BTreeSet<IR::Ability>)>,
+            ),
         >,
         function_declarations: &HashMap<
             (ModuleIdent, FunctionName),
@@ -135,7 +137,7 @@ impl<'a> Context<'a> {
     fn struct_dependencies(
         struct_declarations: &HashMap<
             (ModuleIdent, StructName),
-            (bool, Vec<(IR::TypeVar, IR::Kind)>),
+            (BTreeSet<Ability>, Vec<(IR::TypeVar, BTreeSet<IR::Ability>)>),
         >,
         module_dependencies: &mut BTreeMap<
             ModuleIdent,
@@ -152,17 +154,17 @@ impl<'a> Context<'a> {
     fn struct_dependency(
         struct_declarations: &HashMap<
             (ModuleIdent, StructName),
-            (bool, Vec<(IR::TypeVar, IR::Kind)>),
+            (BTreeSet<Ability>, Vec<(IR::TypeVar, BTreeSet<IR::Ability>)>),
         >,
         module: &ModuleIdent,
         sname: StructName,
     ) -> IR::StructDependency {
         let key = (module.clone(), sname.clone());
-        let (is_nominal_resource, type_formals) = struct_declarations.get(&key).unwrap().clone();
+        let (abilities, type_formals) = struct_declarations.get(&key).unwrap().clone();
         let name = Self::translate_struct_name(sname);
         IR::StructDependency {
             name,
-            is_nominal_resource,
+            abilities,
             type_formals,
         }
     }
@@ -206,21 +208,21 @@ impl<'a> Context<'a> {
     //**********************************************************************************************
 
     fn ir_module_alias(ident: &ModuleIdent) -> IR::ModuleName {
-        let ModuleIdent_ { address, name } = &ident.0.value;
+        let (address, name) = &ident.value;
         IR::ModuleName::new(format!("{}::{}", address, name))
     }
 
     fn translate_module_ident(ident: ModuleIdent) -> IR::ModuleIdent {
-        let ModuleIdent_ { address, name } = ident.0.value;
-        let name = Self::translate_module_name(name);
+        let (address, name) = ident.value;
+        let name = Self::translate_module_name_(name);
         IR::ModuleIdent::Qualified(IR::QualifiedModuleIdent::new(
             name,
             DiemAddress::new(address.to_u8()),
         ))
     }
 
-    fn translate_module_name(n: ModuleName) -> IR::ModuleName {
-        IR::ModuleName::new(n.0.value)
+    fn translate_module_name_(s: String) -> IR::ModuleName {
+        IR::ModuleName::new(s)
     }
 
     fn translate_struct_name(n: StructName) -> IR::StructName {

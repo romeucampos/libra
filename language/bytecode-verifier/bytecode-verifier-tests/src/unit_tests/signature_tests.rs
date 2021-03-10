@@ -86,6 +86,7 @@ fn no_verify_locals_good() {
             },
         ],
         field_handles: vec![],
+        friend_decls: vec![],
         struct_def_instantiations: vec![],
         function_instantiations: vec![],
         field_instantiations: vec![],

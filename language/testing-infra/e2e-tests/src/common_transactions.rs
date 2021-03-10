@@ -4,7 +4,7 @@
 //! Support for encoding transactions for common situations.
 
 use crate::account::Account;
-use compiled_stdlib::transaction_scripts::StdlibScript;
+use compiled_stdlib::legacy::transaction_scripts::LegacyStdlibScript;
 use compiler::Compiler;
 use diem_types::{
     account_config,
@@ -18,7 +18,7 @@ pub static CREATE_ACCOUNT_SCRIPT: Lazy<Vec<u8>> = Lazy::new(|| {
     import 0x1.Diem;
     import 0x1.DiemAccount;
 
-    main<Token>(account: &signer, fresh_address: address, auth_key_prefix: vector<u8>, initial_amount: u64) {
+    main<Token: store>(account: &signer, fresh_address: address, auth_key_prefix: vector<u8>, initial_amount: u64) {
       let with_cap: DiemAccount.WithdrawCapability;
       let name: vector<u8>;
       name = h\"\";
@@ -131,7 +131,7 @@ pub fn peer_to_peer_txn(
     sender
         .transaction()
         .script(Script::new(
-            StdlibScript::PeerToPeerWithMetadata
+            LegacyStdlibScript::PeerToPeerWithMetadata
                 .compiled_bytes()
                 .into_vec(),
             vec![account_config::xus_tag()],
@@ -147,7 +147,7 @@ pub fn rotate_key_txn(sender: &Account, new_key_hash: Vec<u8>, seq_num: u64) -> 
     sender
         .transaction()
         .script(Script::new(
-            StdlibScript::RotateAuthenticationKey
+            LegacyStdlibScript::RotateAuthenticationKey
                 .compiled_bytes()
                 .into_vec(),
             vec![],
@@ -163,7 +163,7 @@ pub fn raw_rotate_key_txn(sender: &Account, new_key_hash: Vec<u8>, seq_num: u64)
     sender
         .transaction()
         .script(Script::new(
-            StdlibScript::RotateAuthenticationKey
+            LegacyStdlibScript::RotateAuthenticationKey
                 .compiled_bytes()
                 .into_vec(),
             vec![],

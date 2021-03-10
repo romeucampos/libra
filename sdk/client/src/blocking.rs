@@ -1,13 +1,11 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
-
 use super::{
     request::{JsonRpcRequest, MethodRequest},
     response::{MethodResponse, Response},
     state::StateManager,
-    validate, validate_batch, BatchResponse,
+    validate, validate_batch, BatchResponse, USER_AGENT,
 };
 use crate::{
     error::WaitForTransactionError,
@@ -23,6 +21,13 @@ use diem_types::{
     transaction::{SignedTransaction, Transaction},
 };
 use serde::{de::DeserializeOwned, Serialize};
+use std::time::Duration;
+
+// In order to avoid needing to publish the proxy crate to crates.io we simply include the small
+// library in inline by making it a module instead of a dependency. 'src/proxy.rs' is a symlink to
+// '../../../common/proxy/src/lib.rs'
+#[path = "proxy.rs"]
+mod proxy;
 
 const REQUEST_TIMEOUT: u64 = 10_000;
 
@@ -260,6 +265,7 @@ impl BlockingClient {
     fn send_impl<S: Serialize, T: DeserializeOwned>(&self, payload: &S) -> Result<T> {
         let mut request = ureq::post(&self.url)
             .timeout_connect(REQUEST_TIMEOUT)
+            .set("User-Agent", USER_AGENT)
             .build();
 
         let proxy = proxy::Proxy::new();

@@ -24,16 +24,15 @@ use diem_config::{
     network_id::NetworkContext,
 };
 use diem_infallible::RwLock;
-use diem_network_address::NetworkAddress;
 use diem_rate_limiter::rate_limit::TokenBucketRateLimiter;
 use diem_time_service::TimeService;
-use diem_types::PeerId;
+use diem_types::{network_address::NetworkAddress, PeerId};
 use futures::{channel::oneshot, io::AsyncWriteExt, stream::StreamExt};
 use memsocket::MemorySocket;
 use netcore::transport::{
     boxed::BoxedTransport, memory::MemoryTransport, ConnectionOrigin, TransportExt,
 };
-use std::{collections::HashMap, iter::FromIterator, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use tokio_util::compat::{
     FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
@@ -107,7 +106,7 @@ fn build_test_peer_manager(
         Arc::new(RwLock::new(HashMap::new())),
         peer_manager_request_rx,
         connection_reqs_rx,
-        HashMap::from_iter([(TEST_PROTOCOL, hello_tx)].iter().cloned()),
+        [(TEST_PROTOCOL, hello_tx)].iter().cloned().collect(),
         vec![conn_status_tx],
         constants::NETWORK_CHANNEL_SIZE,
         constants::MAX_CONCURRENT_NETWORK_REQS,

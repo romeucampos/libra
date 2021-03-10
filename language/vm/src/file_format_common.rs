@@ -25,8 +25,7 @@ impl BinaryConstants {
     /// The blob that must start a binary.
     pub const DIEM_MAGIC_SIZE: usize = 4;
     pub const DIEM_MAGIC: [u8; BinaryConstants::DIEM_MAGIC_SIZE] = [0xA1, 0x1C, 0xEB, 0x0B];
-    /// The `DIEM_MAGIC` size, 4 byte for major version and 1 byte
-    /// for table count.
+    /// The `DIEM_MAGIC` size, 4 byte for major version and 1 byte for table count.
     pub const HEADER_SIZE: usize = BinaryConstants::DIEM_MAGIC_SIZE + 5;
     /// A (Table Type, Start Offset, Byte Count) size, which is 1 byte for the type and
     /// 4 bytes for the offset/count.
@@ -96,6 +95,7 @@ pub enum TableType {
     FUNCTION_DEFS           = 0xC,
     FIELD_HANDLE            = 0xD,
     FIELD_INST              = 0xE,
+    FRIEND_DECLS            = 0xF,
 }
 
 /// Constants for signature blob values.
@@ -116,25 +116,6 @@ pub enum SerializedType {
     VECTOR                  = 0xA,
     STRUCT_INST             = 0xB,
     SIGNER                  = 0xC,
-}
-
-#[rustfmt::skip]
-#[allow(non_camel_case_types)]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-pub enum SerializedNominalResourceFlag {
-    NOMINAL_RESOURCE        = 0x1,
-    NORMAL_STRUCT           = 0x2,
-}
-
-#[rustfmt::skip]
-#[allow(non_camel_case_types)]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-pub enum SerializedKind {
-    ALL                     = 0x1,
-    COPYABLE                = 0x2,
-    RESOURCE                = 0x3,
 }
 
 #[rustfmt::skip]
@@ -368,12 +349,14 @@ pub fn read_uleb128_as_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 //
 
 /// Version 1: the initial version
-pub const VERSION_1: u32 = 1u32;
+pub const VERSION_1: u32 = 1;
 
 /// Version 2: changes compared with version 1
 ///  + function visibility stored in separate byte before the flags byte
 ///  + the flags byte now contains only the is_native information (at bit 0x2)
-pub const VERSION_2: u32 = 2u32;
+///  + the "friend" visibility modifier
+///  + friend list for modules
+pub const VERSION_2: u32 = 2;
 
 // Mark which version is the latest version
 pub const VERSION_MAX: u32 = VERSION_2;

@@ -28,10 +28,9 @@ use bytes::Bytes;
 use channel::{self, diem_channel, message_queues::QueueStyle};
 use diem_config::network_id::NetworkContext;
 use diem_logger::prelude::*;
-use diem_network_address::NetworkAddress;
 use diem_rate_limiter::rate_limit::TokenBucketRateLimiter;
 use diem_time_service::{TimeService, TimeServiceTrait};
-use diem_types::PeerId;
+use diem_types::{network_address::NetworkAddress, PeerId};
 use futures::{
     channel::oneshot,
     future::{BoxFuture, FutureExt},
@@ -41,6 +40,7 @@ use futures::{
 };
 use netcore::transport::{ConnectionOrigin, Transport};
 use serde::Serialize;
+use short_hex_str::AsShortHexStr;
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt,
@@ -379,10 +379,10 @@ where
             .filter(|(_, (metadata, _))| metadata.origin == ConnectionOrigin::Inbound)
             .count();
         let outbound = total.saturating_sub(inbound);
-        let role = self.network_context.role().as_str();
 
+        // TODO: Work with PEs to update this to be a `NetworkId` rather than `RoleType`
         counters::DIEM_NETWORK_PEERS
-            .with_label_values(&[role, "connected"])
+            .with_label_values(&[self.network_context.role().as_str(), "connected"])
             .set(total as i64);
 
         counters::connections(&self.network_context, ConnectionOrigin::Inbound).set(inbound as i64);
@@ -459,51 +459,74 @@ where
         self.sample_connected_peers();
         match event {
             TransportNotification::NewConnection(mut conn) => {
-                // TODO: This is right now a hack around having to feed trusted peers deeper in the outbound path.  Inbound ones are assigned at Noise handshake time.
-                if conn.metadata.origin == ConnectionOrigin::Outbound {
-                    let peer_role = self
-                        .trusted_peers
-                        .read()
-                        .get(&conn.metadata.remote_peer_id)
-                        .map_or(PeerRole::Unknown, |auth_context| auth_context.role);
-                    conn.metadata.role = peer_role;
-                };
+                match conn.metadata.origin {
+                    ConnectionOrigin::Outbound => {
+                        // TODO: This is right now a hack around having to feed trusted peers deeper in the outbound path.  Inbound ones are assigned at Noise handshake time.
+                        conn.metadata.role = self
+                            .trusted_peers
+                            .read()
+                            .get(&conn.metadata.remote_peer_id)
+                            .map_or(PeerRole::Unknown, |auth_context| auth_context.role);
 
-                // TODO: Keep track of somewhere else to not take this hit in case of DDoS
-                let inbound_conns = self
-                    .active_peers
-                    .iter()
-                    .filter(|(_, (metadata, _))| metadata.origin == ConnectionOrigin::Inbound)
-                    .count();
+                        if conn.metadata.role == PeerRole::Unknown {
+                            warn!(
+                                NetworkSchema::new(&self.network_context)
+                                    .connection_metadata_with_address(&conn.metadata),
+                                "{} Outbound connection made with unknown peer role: {}",
+                                self.network_context,
+                                conn.metadata
+                            )
+                        }
+                    }
+                    ConnectionOrigin::Inbound => {
+                        // Everything below here is meant for unknown peers only, role comes from
+                        // Noise handshake and if it's not `Unknown` it is trusted
+                        if conn.metadata.role == PeerRole::Unknown {
+                            // TODO: Keep track of somewhere else to not take this hit in case of DDoS
+                            // Count unknown inbound connections
+                            let unknown_inbound_conns = self
+                                .active_peers
+                                .iter()
+                                .filter(|(peer_id, (metadata, _))| {
+                                    metadata.origin == ConnectionOrigin::Inbound
+                                        && self
+                                            .trusted_peers
+                                            .read()
+                                            .get(peer_id)
+                                            .map_or(true, |peer| peer.role == PeerRole::Unknown)
+                                })
+                                .count();
 
-                // Reject excessive inbound connections by letting them just drop out of scope
-                // We control outbound connections with Connectivity manager before we even send them
-                // and we must allow connections that already exist to pass through tie breaking.
-                // TODO: Allow for trusted peers to still connect
-                if conn.metadata.origin == ConnectionOrigin::Outbound
-                    || self
-                        .active_peers
-                        .contains_key(&conn.metadata.remote_peer_id)
-                    || inbound_conns < self.inbound_connection_limit
-                {
-                    info!(
-                        NetworkSchema::new(&self.network_context)
-                            .connection_metadata_with_address(&conn.metadata),
-                        "{} New connection established: {}", self.network_context, conn.metadata
-                    );
-                    // Add new peer, updating counters and all
-                    self.add_peer(conn);
-                    self.update_connected_peers_metrics();
-                } else {
-                    info!(
-                        NetworkSchema::new(&self.network_context)
-                            .connection_metadata_with_address(&conn.metadata),
-                        "{} Connection rejected due to connection limit: {}",
-                        self.network_context,
-                        conn.metadata
-                    );
-                    self.disconnect(conn);
+                            // Reject excessive inbound connections made by unknown peers
+                            // We control outbound connections with Connectivity manager before we even send them
+                            // and we must allow connections that already exist to pass through tie breaking.
+                            if !self
+                                .active_peers
+                                .contains_key(&conn.metadata.remote_peer_id)
+                                && unknown_inbound_conns > self.inbound_connection_limit
+                            {
+                                info!(
+                                    NetworkSchema::new(&self.network_context)
+                                        .connection_metadata_with_address(&conn.metadata),
+                                    "{} Connection rejected due to connection limit: {}",
+                                    self.network_context,
+                                    conn.metadata
+                                );
+                                self.disconnect(conn);
+                                return;
+                            }
+                        }
+                    }
                 }
+
+                // Add new peer, updating counters and all
+                info!(
+                    NetworkSchema::new(&self.network_context)
+                        .connection_metadata_with_address(&conn.metadata),
+                    "{} New connection established: {}", self.network_context, conn.metadata
+                );
+                self.add_peer(conn);
+                self.update_connected_peers_metrics();
             }
             TransportNotification::Disconnected(lost_conn_metadata, reason) => {
                 // See: https://github.com/diem/diem/issues/3128#issuecomment-605351504 for

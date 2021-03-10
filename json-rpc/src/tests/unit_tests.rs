@@ -8,9 +8,10 @@ use crate::{
         genesis::generate_genesis_state,
         utils::{test_bootstrap, MockDiemDB},
     },
+    util::vm_status_view_from_kept_vm_status,
 };
 use diem_client::{
-    views::{BytesView, TransactionDataView, VMStatusView},
+    views::{BytesView, TransactionDataView},
     BlockingClient, MethodRequest,
 };
 use diem_config::{config::DEFAULT_CONTENT_LENGTH_LIMIT, utils};
@@ -75,7 +76,7 @@ fn mock_db() -> MockDiemDB {
     let mut all_accounts = HashMap::new();
     let mut all_txns = vec![];
     let mut events = vec![];
-    let mut timestamps = vec![0 as u64];
+    let mut timestamps = vec![0_u64];
 
     for (txns_to_commit, ledger_info_with_sigs) in &blocks {
         for (idx, txn) in txns_to_commit.iter().enumerate() {
@@ -1311,7 +1312,7 @@ fn test_get_transactions() {
                 .collect::<Vec<_>>();
 
             assert_eq!(expected_events.len(), view.events.len());
-            assert_eq!(VMStatusView::from(status), view.vm_status);
+            assert_eq!(vm_status_view_from_kept_vm_status(status), view.vm_status);
 
             for (i, event_view) in view.events.iter().enumerate() {
                 let expected_event = expected_events.get(i).expect("Expected event didn't find");
@@ -1400,7 +1401,10 @@ fn test_get_account_transaction() {
             assert_eq!(tx_view.events.len(), expected_events.len());
 
             // check VM status
-            assert_eq!(tx_view.vm_status, VMStatusView::from(expected_status));
+            assert_eq!(
+                tx_view.vm_status,
+                vm_status_view_from_kept_vm_status(expected_status)
+            );
 
             for (i, event_view) in tx_view.events.iter().enumerate() {
                 let expected_event = expected_events.get(i).expect("Expected event didn't find");
@@ -1639,5 +1643,6 @@ fn gen_string(len: usize) -> String {
     std::iter::repeat(())
         .map(|()| rng.sample(Alphanumeric))
         .take(len)
+        .map(char::from)
         .collect()
 }

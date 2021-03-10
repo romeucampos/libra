@@ -13,13 +13,13 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.38"
-hex = "0.4.2"
-reqwest = { version = "0.11.0", features = ["blocking", "json"] }
+hex = "0.4.3"
+reqwest = { version = "0.11.2", features = ["blocking", "json"] }
 structopt = "0.3.21"
 futures = "0.3.12"
-tokio = { version = "1.2.0", features = ["full"] }
+tokio = { version = "1.3.0", features = ["full"] }
 
-diem-workspace-hack = { path = "../../../common/workspace-hack", version = "0.1.0" }
-diem-client = { path = "../../../sdk/client", version = "0.1.0" }
-diem-types = { path = "../../../types", version = "0.1.0" }
+diem-workspace-hack = { path = "../../../common/workspace-hack" }
+diem-client = { path = "../../../sdk/client" }
+diem-types = { path = "../../../types" }
 bcs = "0.1.2"

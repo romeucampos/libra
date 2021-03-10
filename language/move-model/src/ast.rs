@@ -219,6 +219,8 @@ pub enum PropertyValue {
 /// Specification and properties associated with a language item.
 #[derive(Debug, Clone, Default)]
 pub struct Spec {
+    // The location of this specification, if available.
+    pub loc: Option<Loc>,
     // The set of conditions associated with this item.
     pub conditions: Vec<Condition>,
     // Any pragma properties associated with this item.
@@ -336,6 +338,7 @@ pub enum Exp {
         NodeId,
         QuantKind,
         Vec<(LocalVarDecl, Exp)>,
+        Vec<Vec<Exp>>,
         Option<Box<Exp>>,
         Box<Exp>,
     ),
@@ -460,11 +463,16 @@ impl Exp {
                 }
             }
             Lambda(_, _, body) => body.visit_pre_post(visitor),
-            Quant(_, _, ranges, condition, body) => {
+            Quant(_, _, ranges, triggers, condition, body) => {
                 for (_, range) in ranges {
                     range.visit_pre_post(visitor);
                 }
-                if let Some(exp) = &condition {
+                for trigger in triggers {
+                    for e in trigger {
+                        e.visit_pre_post(visitor);
+                    }
+                }
+                if let Some(exp) = condition {
                     exp.visit_pre_post(visitor);
                 }
                 body.visit_pre_post(visitor);
@@ -485,6 +493,84 @@ impl Exp {
             _ => {}
         }
         visitor(true, self);
+    }
+
+    /// Rewrites this expression based on the rewriter function. In
+    /// `let (is_rewritten, exp) = rewriter(exp)`, the function should return true if
+    /// the expression was rewritten, false and the original expression if not. In case the
+    /// expression is rewritten, the expression tree will not further be traversed and the
+    /// rewritten expression immediately returned. Otherwise, the function will recurse and
+    /// rewrite sub-expressions.
+    pub fn rewrite<F>(self, rewriter: &mut F) -> Exp
+    where
+        F: FnMut(Exp) -> (bool, Exp),
+    {
+        use Exp::*;
+        let (is_rewritten, exp) = rewriter(self);
+        if is_rewritten {
+            return exp;
+        }
+
+        let rewrite_vec = |rewriter: &mut F, exps: Vec<Exp>| -> Vec<Exp> {
+            exps.into_iter().map(|e| e.rewrite(rewriter)).collect()
+        };
+        let rewrite_box =
+            |rewriter: &mut F, exp: Box<Exp>| -> Box<Exp> { Box::new(exp.rewrite(rewriter)) };
+        let rewrite_decl = |rewriter: &mut F, d: LocalVarDecl| LocalVarDecl {
+            id: d.id,
+            name: d.name,
+            binding: d.binding.map(|e| e.rewrite(rewriter)),
+        };
+        let rewrite_decls = |rewriter: &mut F, decls: Vec<LocalVarDecl>| -> Vec<LocalVarDecl> {
+            decls
+                .into_iter()
+                .map(|d| rewrite_decl(rewriter, d))
+                .collect()
+        };
+        let rewrite_quant_decls =
+            |rewriter: &mut F, decls: Vec<(LocalVarDecl, Exp)>| -> Vec<(LocalVarDecl, Exp)> {
+                decls
+                    .into_iter()
+                    .map(|(d, r)| (rewrite_decl(rewriter, d), r.rewrite(rewriter)))
+                    .collect()
+            };
+
+        match exp {
+            Call(id, oper, args) => Call(id, oper, rewrite_vec(rewriter, args)),
+            Invoke(id, target, args) => Invoke(
+                id,
+                rewrite_box(rewriter, target),
+                rewrite_vec(rewriter, args),
+            ),
+            Lambda(id, decls, body) => Lambda(
+                id,
+                rewrite_decls(rewriter, decls),
+                rewrite_box(rewriter, body),
+            ),
+            Quant(id, kind, decls, triggers, condition, body) => Quant(
+                id,
+                kind,
+                rewrite_quant_decls(rewriter, decls),
+                triggers
+                    .into_iter()
+                    .map(|t| t.into_iter().map(|e| e.rewrite(rewriter)).collect())
+                    .collect(),
+                condition.map(|e| rewrite_box(rewriter, e)),
+                rewrite_box(rewriter, body),
+            ),
+            Block(id, decls, body) => Block(
+                id,
+                rewrite_decls(rewriter, decls),
+                rewrite_box(rewriter, body),
+            ),
+            IfElse(id, c, t, e) => IfElse(
+                id,
+                rewrite_box(rewriter, c),
+                rewrite_box(rewriter, t),
+                rewrite_box(rewriter, e),
+            ),
+            _ => exp,
+        }
     }
 
     /// Returns the set of module ids used by this expression.
@@ -547,6 +633,7 @@ pub enum Operation {
     Len,
     TypeValue,
     TypeDomain,
+    ResourceDomain,
     Global(Option<MemoryLabel>),
     Exists(Option<MemoryLabel>),
     CanModify,
@@ -559,8 +646,17 @@ pub enum Operation {
     MaxU8,
     MaxU64,
     MaxU128,
+
+    // Functions which support the transformation and translation process.
     AbortFlag,
     AbortCode,
+    WellFormed,
+    BoxValue,
+    UnboxValue,
+    EmptyEventStore,
+    ExtendEventStore,
+    EventStoreIncludes,
+    EventStoreIncludedIn,
 
     // Operation with no effect
     NoOp,
@@ -831,7 +927,12 @@ impl<'a> fmt::Display for ExpDisplay<'a> {
                     body.display(self.env)
                 )
             }
-            Quant(_, kind, decls, opt_where, body) => {
+            Quant(_, kind, decls, triggers, opt_where, body) => {
+                let triggers_str = triggers
+                    .iter()
+                    .map(|trigger| format!("{{{}}}", self.fmt_exps(trigger)))
+                    .collect_vec()
+                    .join("");
                 let where_str = if let Some(exp) = opt_where {
                     format!(" where {}", exp.display(self.env))
                 } else {
@@ -839,9 +940,10 @@ impl<'a> fmt::Display for ExpDisplay<'a> {
                 };
                 write!(
                     f,
-                    "{} {}{}: {}",
+                    "{} {}{}{}: {}",
                     kind,
                     self.fmt_quant_decls(decls),
+                    triggers_str,
                     where_str,
                     body.display(self.env)
                 )
@@ -955,7 +1057,7 @@ impl<'a> fmt::Display for OperationDisplay<'a> {
             _ => write!(f, "{:?}", self.oper),
         }?;
 
-        // If operation as a type instantiation, add it.
+        // If operation has a type instantiation, add it.
         let type_inst = self.env.get_node_instantiation(self.node_id);
         if !type_inst.is_empty() {
             let tctx = TypeDisplayContext::WithEnv {

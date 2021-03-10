@@ -12,9 +12,12 @@ use diem_config::{
 };
 use diem_crypto::{test_utils::TEST_SEED, traits::Uniform, x25519};
 use diem_infallible::RwLock;
-use diem_network_address::{NetworkAddress, Protocol::*};
 use diem_time_service::MockTimeService;
-use diem_types::{chain_id::ChainId, PeerId};
+use diem_types::{
+    chain_id::ChainId,
+    network_address::{NetworkAddress, Protocol::*},
+    PeerId,
+};
 use futures::{future, io::AsyncWriteExt, stream::StreamExt};
 use netcore::{
     framing::{read_u16frame, write_u16frame},
@@ -100,8 +103,11 @@ where
                 )
             }
             Auth::MaybeMutual => {
-                let listener_peer_id = PeerId::from_identity_public_key(listener_key.public_key());
-                let dialer_peer_id = PeerId::from_identity_public_key(dialer_key.public_key());
+                let listener_peer_id = diem_types::account_address::from_identity_public_key(
+                    listener_key.public_key(),
+                );
+                let dialer_peer_id =
+                    diem_types::account_address::from_identity_public_key(dialer_key.public_key());
                 let trusted_peers = build_trusted_peers(
                     dialer_peer_id,
                     &dialer_key,
@@ -120,8 +126,11 @@ where
                 )
             }
             Auth::ServerOnly => {
-                let listener_peer_id = PeerId::from_identity_public_key(listener_key.public_key());
-                let dialer_peer_id = PeerId::from_identity_public_key(dialer_key.public_key());
+                let listener_peer_id = diem_types::account_address::from_identity_public_key(
+                    listener_key.public_key(),
+                );
+                let dialer_peer_id =
+                    diem_types::account_address::from_identity_public_key(dialer_key.public_key());
                 let trusted_peers = Arc::new(RwLock::new(HashMap::new()));
 
                 (

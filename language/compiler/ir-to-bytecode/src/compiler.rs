@@ -18,16 +18,17 @@ use std::{
     clone::Clone,
     collections::{
         hash_map::Entry::{Occupied, Vacant},
-        HashMap, VecDeque,
+        BTreeSet, HashMap, VecDeque,
     },
 };
 use vm::{
     errors::Location as VMErrorLocation,
     file_format::{
-        Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
-        CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition, FunctionSignature, Kind,
-        Signature, SignatureToken, StructDefinition, StructDefinitionIndex, StructFieldInformation,
-        StructHandleIndex, TableIndex, TypeParameterIndex, TypeSignature, Visibility,
+        Ability, AbilitySet, Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut,
+        CompiledScript, CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition,
+        FunctionSignature, ModuleHandle, Signature, SignatureToken, StructDefinition,
+        StructDefinitionIndex, StructFieldInformation, StructHandleIndex, TableIndex,
+        TypeParameterIndex, TypeSignature, Visibility,
     },
 };
 
@@ -360,12 +361,11 @@ impl FunctionFrame {
         Ok(cur_loc_idx)
     }
 
-    fn push_loop(&mut self, start_loc: usize) -> Result<()> {
+    fn push_loop(&mut self, start_loc: usize) {
         self.loops.push(LoopInfo {
             start_loc,
             breaks: Vec::new(),
         });
-        Ok(())
     }
 
     fn pop_loop(&mut self) -> Result<()> {
@@ -494,10 +494,16 @@ pub fn compile_module<'a>(
     for dep in dependencies {
         context.add_compiled_dependency(dep)?;
     }
+
+    // Compile friends
+    let friend_decls = compile_friends(&mut context, Some(address), module.friends)?;
+
+    // Compile imports
     let self_name = ModuleName::new(ModuleName::self_name().into());
     let self_module_handle_idx = context.declare_import(current_module, self_name.clone())?;
     // Explicitly declare all imports as they will be included even if not used
     compile_imports(&mut context, Some(address), module.imports.clone())?;
+
     // Add explicit handles/dependency declarations to `dependencies`
     compile_explicit_dependency_declarations(
         &mut context,
@@ -508,12 +514,13 @@ pub fn compile_module<'a>(
 
     // Explicitly declare all structs as they will be included even if not used
     for s in &module.structs {
+        let abilities = abilities(&s.value.abilities);
         let ident = QualifiedStructIdent {
             module: self_name.clone(),
             name: s.value.name.clone(),
         };
-        let kinds = type_parameter_kinds(&s.value.type_formals);
-        context.declare_struct_handle_index(ident, s.value.is_nominal_resource, kinds)?;
+        let type_parameters = type_parameter_kinds(&s.value.type_formals);
+        context.declare_struct_handle_index(ident, abilities, type_parameters)?;
     }
 
     for ir_constant in module.constants {
@@ -528,8 +535,7 @@ pub fn compile_module<'a>(
         context.declare_function(self_name.clone(), name.clone(), sig)?;
     }
 
-    // Current module
-
+    // Compile definitions
     let struct_defs = compile_structs(&mut context, &self_name, module.structs)?;
     let function_defs = compile_functions(&mut context, &self_name, module.functions)?;
 
@@ -556,6 +562,7 @@ pub fn compile_module<'a>(
         struct_handles,
         function_handles,
         field_handles,
+        friend_decls,
         struct_def_instantiations,
         function_instantiations,
         field_instantiations,
@@ -596,13 +603,14 @@ fn compile_explicit_dependency_declarations(
         let self_module_handle_idx = context.module_handle_index(&mname)?;
         for struct_dep in structs {
             let StructDependency {
-                is_nominal_resource,
+                abilities: abs,
                 name,
                 type_formals: tys,
             } = struct_dep;
             let sname = QualifiedStructIdent::new(mname.clone(), name);
+            let ability_set = abilities(&abs);
             let kinds = type_parameter_kinds(&tys);
-            context.declare_struct_handle_index(sname, is_nominal_resource, kinds)?;
+            context.declare_struct_handle_index(sname, ability_set, kinds)?;
         }
         for function_dep in functions {
             let FunctionDependency { name, signature } = function_dep;
@@ -633,6 +641,7 @@ fn compile_explicit_dependency_declarations(
             struct_handles,
             function_handles,
             field_handles,
+            friend_decls: vec![],
             struct_def_instantiations,
             function_instantiations,
             field_instantiations,
@@ -657,6 +666,29 @@ fn compile_explicit_dependency_declarations(
     Ok(())
 }
 
+fn compile_friends(
+    context: &mut Context,
+    address_opt: Option<AccountAddress>,
+    friends: Vec<ast::ModuleIdent>,
+) -> Result<Vec<ModuleHandle>> {
+    let mut friend_decls = vec![];
+    for friend in friends {
+        let ident = match (address_opt, friend) {
+            (Some(address), ModuleIdent::Transaction(name)) => {
+                QualifiedModuleIdent { address, name }
+            }
+            (None, ModuleIdent::Transaction(name)) => bail!(
+                "Invalid friend '{}'. No address specified for script so cannot resolve friend",
+                name
+            ),
+            (_, ModuleIdent::Qualified(id)) => id,
+        };
+        let handle = context.declare_friend(ident)?;
+        friend_decls.push(handle);
+    }
+    Ok(friend_decls)
+}
+
 fn compile_imports(
     context: &mut Context,
     address_opt: Option<AccountAddress>,
@@ -679,7 +711,7 @@ fn compile_imports(
 }
 
 fn type_parameter_indexes(
-    ast_tys: &[(TypeVar, ast::Kind)],
+    ast_tys: &[(TypeVar, BTreeSet<ast::Ability>)],
 ) -> Result<HashMap<TypeVar_, TypeParameterIndex>> {
     let mut m = HashMap::new();
     for (idx, (ty_var, _)) in ast_tys.iter().enumerate() {
@@ -707,15 +739,23 @@ fn make_type_argument_subst(
     Ok(subst)
 }
 
-fn type_parameter_kinds(ast_tys: &[(TypeVar, ast::Kind)]) -> Vec<Kind> {
-    ast_tys.iter().map(|(_, k)| kind(k)).collect()
+fn type_parameter_kinds(ast_tys: &[(TypeVar, BTreeSet<ast::Ability>)]) -> Vec<AbilitySet> {
+    ast_tys.iter().map(|(_, abs)| abilities(abs)).collect()
 }
 
-fn kind(ast_k: &ast::Kind) -> Kind {
-    match ast_k {
-        ast::Kind::All => Kind::All,
-        ast::Kind::Resource => Kind::Resource,
-        ast::Kind::Copyable => Kind::Copyable,
+fn abilities(abilities: &BTreeSet<ast::Ability>) -> AbilitySet {
+    abilities
+        .iter()
+        .map(|a| ability(a))
+        .fold(AbilitySet::EMPTY, |acc, a| acc | a)
+}
+
+fn ability(ab: &ast::Ability) -> Ability {
+    match ab {
+        ast::Ability::Copy => Ability::Copy,
+        ast::Ability::Drop => Ability::Drop,
+        ast::Ability::Store => Ability::Store,
+        ast::Ability::Key => Ability::Key,
     }
 }
 
@@ -785,7 +825,11 @@ fn function_signature(
         .iter()
         .map(|(_, ty)| compile_type(context, &m, ty))
         .collect::<Result<_>>()?;
-    let type_parameters = f.type_formals.iter().map(|(_, k)| kind(k)).collect();
+    let type_parameters = f
+        .type_formals
+        .iter()
+        .map(|(_, abs)| abilities(abs))
+        .collect();
     Ok(vm::file_format::FunctionSignature {
         return_,
         parameters,
@@ -910,8 +954,10 @@ fn compile_function(
     let ast_function = ast_function.value;
 
     let visibility = match ast_function.visibility {
-        FunctionVisibility::Internal => Visibility::Private,
         FunctionVisibility::Public => Visibility::Public,
+        FunctionVisibility::Script => Visibility::Script,
+        FunctionVisibility::Friend => Visibility::Friend,
+        FunctionVisibility::Internal => Visibility::Private,
     };
     let acquires_global_resources = ast_function
         .acquires
@@ -1043,7 +1089,7 @@ fn compile_while(
     make_push_instr!(context, code);
     let cond_span = while_.cond.loc;
     let loop_start_loc = code.len();
-    function_frame.push_loop(loop_start_loc)?;
+    function_frame.push_loop(loop_start_loc);
     compile_expression(context, function_frame, code, while_.cond)?;
 
     let brfalse_loc = code.len();
@@ -1085,7 +1131,7 @@ fn compile_loop(
 ) -> Result<ControlFlowInfo> {
     make_push_instr!(context, code);
     let loop_start_loc = code.len();
-    function_frame.push_loop(loop_start_loc)?;
+    function_frame.push_loop(loop_start_loc);
 
     let body_cf_info = compile_block(context, function_frame, code, loop_.block.value)?;
     push_instr!(loop_.block.loc, Bytecode::Branch(loop_start_loc as u16));

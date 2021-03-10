@@ -3,10 +3,10 @@
 
 use crate::{
     counters,
+    error::Error,
     logging::{LogEntry, LogEvent, LogSchema},
     shared_components::SyncState,
 };
-use anyhow::{format_err, Result};
 use diem_logger::prelude::*;
 use diem_types::{
     account_state::AccountState,
@@ -25,7 +25,7 @@ use subscription_service::ReconfigSubscription;
 /// Proxies interactions with execution and storage for state synchronization
 pub trait ExecutorProxyTrait: Send {
     /// Sync the local state with the latest in storage.
-    fn get_local_storage_state(&self) -> Result<SyncState>;
+    fn get_local_storage_state(&self) -> Result<SyncState, Error>;
 
     /// Execute and commit a batch of transactions
     fn execute_chunk(
@@ -33,7 +33,7 @@ pub trait ExecutorProxyTrait: Send {
         txn_list_with_proof: TransactionListWithProof,
         verified_target_li: LedgerInfoWithSignatures,
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
-    ) -> Result<()>;
+    ) -> Result<(), Error>;
 
     /// Gets chunk of transactions given the known version, target version and the max limit.
     fn get_chunk(
@@ -41,19 +41,20 @@ pub trait ExecutorProxyTrait: Send {
         known_version: u64,
         limit: u64,
         target_version: u64,
-    ) -> Result<TransactionListWithProof>;
+    ) -> Result<TransactionListWithProof, Error>;
 
     /// Get the epoch changing ledger info for the given epoch so that we can move to next epoch.
-    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures>;
+    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures, Error>;
 
     /// Get ledger info at an epoch boundary version.
-    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures>;
+    fn get_epoch_ending_ledger_info(&self, version: u64)
+        -> Result<LedgerInfoWithSignatures, Error>;
 
     /// Returns the ledger's timestamp for the given version in microseconds
-    fn get_version_timestamp(&self, version: u64) -> Result<u64>;
+    fn get_version_timestamp(&self, version: u64) -> Result<u64, Error>;
 
     /// publishes on-chain config updates to subscribed components
-    fn publish_on_chain_config_updates(&mut self, events: Vec<ContractEvent>) -> Result<()>;
+    fn publish_on_chain_config_updates(&mut self, events: Vec<ContractEvent>) -> Result<(), Error>;
 }
 
 pub(crate) struct ExecutorProxy {
@@ -84,27 +85,44 @@ impl ExecutorProxy {
         }
     }
 
-    fn fetch_all_configs(storage: &dyn DbReader) -> Result<OnChainConfigPayload> {
+    fn fetch_all_configs(storage: &dyn DbReader) -> Result<OnChainConfigPayload, Error> {
         let access_paths = ON_CHAIN_CONFIG_REGISTRY
             .iter()
             .map(|config_id| config_id.access_path())
             .collect();
-        let configs = storage.batch_fetch_resources(access_paths)?;
-        let epoch = storage
-            .get_account_state_with_proof_by_version(
-                config_address(),
-                storage.fetch_synced_version()?,
-            )?
-            .0
+        let configs = storage
+            .batch_fetch_resources(access_paths)
+            .map_err(|error| {
+                Error::UnexpectedError(format!("Failed batch fetch of resources: {}", error))
+            })?;
+        let synced_version = storage.fetch_synced_version().map_err(|error| {
+            Error::UnexpectedError(format!("Failed to fetch storage synced version: {}", error))
+        })?;
+
+        let account_state_blob = storage
+            .get_account_state_with_proof_by_version(config_address(), synced_version)
+            .map_err(|error| {
+                Error::UnexpectedError(format!(
+                    "Failed to fetch account state with proof {}",
+                    error
+                ))
+            })?
+            .0;
+        let epoch = account_state_blob
             .map(|blob| {
                 AccountState::try_from(&blob).and_then(|state| {
                     Ok(state
                         .get_configuration_resource()?
-                        .ok_or_else(|| format_err!("ConfigurationResource does not exist"))?
+                        .ok_or_else(|| {
+                            Error::UnexpectedError("Configuration resource does not exist".into())
+                        })?
                         .epoch())
                 })
             })
-            .ok_or_else(|| format_err!("Failed to fetch ConfigurationResource"))??;
+            .ok_or_else(|| Error::UnexpectedError("Missing account state blob".into()))?
+            .map_err(|error| {
+                Error::UnexpectedError(format!("Failed to fetch configuration resource: {}", error))
+            })?;
 
         Ok(OnChainConfigPayload::new(
             epoch,
@@ -120,11 +138,15 @@ impl ExecutorProxy {
 }
 
 impl ExecutorProxyTrait for ExecutorProxy {
-    fn get_local_storage_state(&self) -> Result<SyncState> {
-        let storage_info = self
-            .storage
-            .get_startup_info()?
-            .ok_or_else(|| format_err!("[state sync] Missing storage info"))?;
+    fn get_local_storage_state(&self) -> Result<SyncState, Error> {
+        let storage_info = self.storage.get_startup_info().map_err(|error| {
+            Error::UnexpectedError(format!(
+                "Failed to get startup info from storage: {}",
+                error
+            ))
+        })?;
+        let storage_info = storage_info
+            .ok_or_else(|| Error::UnexpectedError("Missing startup info from storage".into()))?;
         let current_epoch_state = storage_info.get_epoch_state().clone();
 
         let synced_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state {
@@ -145,14 +167,19 @@ impl ExecutorProxyTrait for ExecutorProxy {
         txn_list_with_proof: TransactionListWithProof,
         verified_target_li: LedgerInfoWithSignatures,
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // track chunk execution time
         let timer = counters::EXECUTE_CHUNK_DURATION.start_timer();
-        let reconfig_events = self.executor.execute_and_commit_chunk(
-            txn_list_with_proof,
-            verified_target_li,
-            intermediate_end_of_epoch_li,
-        )?;
+        let reconfig_events = self
+            .executor
+            .execute_and_commit_chunk(
+                txn_list_with_proof,
+                verified_target_li,
+                intermediate_end_of_epoch_li,
+            )
+            .map_err(|error| {
+                Error::UnexpectedError(format!("Execute and commit chunk failed: {}", error))
+            })?;
         timer.stop_and_record();
         if let Err(e) = self.publish_on_chain_config_updates(reconfig_events) {
             error!(
@@ -171,34 +198,53 @@ impl ExecutorProxyTrait for ExecutorProxy {
         known_version: u64,
         limit: u64,
         target_version: u64,
-    ) -> Result<TransactionListWithProof> {
+    ) -> Result<TransactionListWithProof, Error> {
         let starting_version = known_version
             .checked_add(1)
-            .ok_or_else(|| format_err!("Starting version has overflown!"))?;
+            .ok_or_else(|| Error::IntegerOverflow("Starting version has overflown!".into()))?;
         self.storage
             .get_transactions(starting_version, limit, target_version, false)
+            .map_err(|error| {
+                Error::UnexpectedError(format!("Failed to get transactions from storage {}", error))
+            })
     }
 
-    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures, Error> {
         let next_epoch = epoch
             .checked_add(1)
-            .ok_or_else(|| format_err!("Next epoch has overflown!"))?;
-        self.storage
-            .get_epoch_ending_ledger_infos(epoch, next_epoch)?
+            .ok_or_else(|| Error::IntegerOverflow("Next epoch has overflown!".into()))?;
+        let mut epoch_ending_ledger_infos = self
+            .storage
+            .get_epoch_ending_ledger_infos(epoch, next_epoch)
+            .map_err(|error| Error::UnexpectedError(error.to_string()))?;
+
+        epoch_ending_ledger_infos
             .ledger_info_with_sigs
             .pop()
-            .ok_or_else(|| format_err!("Empty EpochChangeProof"))
+            .ok_or_else(|| {
+                Error::UnexpectedError(format!(
+                    "Missing epoch change ledger info for epoch: {:?}",
+                    epoch
+                ))
+            })
     }
 
-    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
-        self.storage.get_epoch_ending_ledger_info(version)
+    fn get_epoch_ending_ledger_info(
+        &self,
+        version: u64,
+    ) -> Result<LedgerInfoWithSignatures, Error> {
+        self.storage
+            .get_epoch_ending_ledger_info(version)
+            .map_err(|error| Error::UnexpectedError(error.to_string()))
     }
 
-    fn get_version_timestamp(&self, version: u64) -> Result<u64> {
-        self.storage.get_block_timestamp(version)
+    fn get_version_timestamp(&self, version: u64) -> Result<u64, Error> {
+        self.storage
+            .get_block_timestamp(version)
+            .map_err(|error| Error::UnexpectedError(error.to_string()))
     }
 
-    fn publish_on_chain_config_updates(&mut self, events: Vec<ContractEvent>) -> Result<()> {
+    fn publish_on_chain_config_updates(&mut self, events: Vec<ContractEvent>) -> Result<(), Error> {
         if events.is_empty() {
             return Ok(());
         }
@@ -217,12 +263,9 @@ impl ExecutorProxyTrait for ExecutorProxy {
             .configs()
             .iter()
             .filter(|(id, cfg)| {
-                &self
-                    .on_chain_configs
-                    .configs()
-                    .get(id)
-                    .expect("missing on-chain config value in local copy")
-                    != cfg
+                &self.on_chain_configs.configs().get(id).unwrap_or_else(|| {
+                    panic!("Missing on-chain config value in local copy: {}", id)
+                }) != cfg
             })
             .map(|(id, _)| *id)
             .collect::<HashSet<_>>();
@@ -241,7 +284,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
                     error!(
                         LogSchema::event_log(LogEntry::Reconfig, LogEvent::PublishError)
                             .subscription_name(subscription.name.clone())
-                            .error(&e),
+                            .error(&Error::UnexpectedError(e.to_string())),
                         "Failed to publish reconfig notification to subscription {}",
                         subscription.name
                     );
@@ -263,7 +306,9 @@ impl ExecutorProxyTrait for ExecutorProxy {
                 .inc();
             Ok(())
         } else {
-            Err(format_err!("failed to publish at least one subscription"))
+            Err(Error::UnexpectedError(
+                "Failed to publish at least one subscription!".into(),
+            ))
         }
     }
 }
@@ -272,8 +317,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
 mod tests {
     use super::*;
     use channel::diem_channel::Receiver;
-    use compiled_stdlib::transaction_scripts::StdlibScript;
-    use diem_crypto::{ed25519::*, HashValue, PrivateKey, Uniform};
+    use diem_crypto::{ed25519::*, PrivateKey, Uniform};
     use diem_types::{
         account_address::AccountAddress,
         account_config::{diem_root_address, xus_tag},
@@ -281,7 +325,7 @@ mod tests {
         contract_event::ContractEvent,
         ledger_info::LedgerInfoWithSignatures,
         on_chain_config::{
-            OnChainConfig, OnChainConfigPayload, VMConfig, VMPublishingOption, ValidatorSet,
+            DiemVersion, OnChainConfig, OnChainConfigPayload, VMConfig, ValidatorSet,
         },
         transaction::{Transaction, WriteSetPayload},
     };
@@ -296,9 +340,8 @@ mod tests {
     use storage_interface::DbReaderWriter;
     use subscription_service::ReconfigSubscription;
     use transaction_builder::{
-        encode_add_to_script_allow_list_script, encode_block_prologue_script,
         encode_peer_to_peer_with_metadata_script,
-        encode_set_validator_config_and_reconfigure_script,
+        encode_set_validator_config_and_reconfigure_script, encode_update_diem_version_script,
     };
     use vm_genesis::Validator;
 
@@ -312,13 +355,13 @@ mod tests {
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer, and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer, and update the validator set
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the block
-        let block = vec![dummy_txn, allowlist_txn];
+        let block = vec![dummy_txn, reconfig_txn];
         let (reconfig_events, _) = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Publish the on chain config updates
@@ -336,17 +379,17 @@ mod tests {
     #[test]
     fn test_pub_sub_drop_receiver() {
         let (subscription, mut reconfig_receiver) =
-            ReconfigSubscription::subscribe_all("", vec![VMPublishingOption::CONFIG_ID], vec![]);
+            ReconfigSubscription::subscribe_all("", vec![DiemVersion::CONFIG_ID], vec![]);
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer, and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer, and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the reconfig block
-        let block = vec![dummy_txn, allowlist_txn];
+        let block = vec![dummy_txn, reconfig_txn];
         let (reconfig_events, _) = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Drop the reconfig receiver
@@ -362,23 +405,23 @@ mod tests {
     fn test_pub_sub_multiple_subscriptions() {
         let (subscription, mut reconfig_receiver) = ReconfigSubscription::subscribe_all(
             "",
-            vec![ValidatorSet::CONFIG_ID, VMPublishingOption::CONFIG_ID],
+            vec![ValidatorSet::CONFIG_ID, DiemVersion::CONFIG_ID],
             vec![],
         );
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer, and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer, and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Give the validator some money so it can send a rotation tx and rotate the validator's consensus key.
         let money_txn = create_transfer_to_validator_transaction(validator_account, 2);
         let rotation_txn = create_consensus_key_rotation_transaction(&validators[0], 0);
 
         // Execute and commit the reconfig block
-        let block = vec![dummy_txn, allowlist_txn, money_txn, rotation_txn];
+        let block = vec![dummy_txn, reconfig_txn, money_txn, rotation_txn];
         let (reconfig_events, _) = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Publish the on chain config updates
@@ -396,7 +439,7 @@ mod tests {
     #[test]
     fn test_pub_sub_no_reconfig_events() {
         let (subscription, mut reconfig_receiver) =
-            ReconfigSubscription::subscribe_all("", vec![VMPublishingOption::CONFIG_ID], vec![]);
+            ReconfigSubscription::subscribe_all("", vec![DiemVersion::CONFIG_ID], vec![]);
         let (_, _, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
@@ -419,13 +462,13 @@ mod tests {
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer, and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer, and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the reconfig block
-        let block = vec![dummy_txn, allowlist_txn];
+        let block = vec![dummy_txn, reconfig_txn];
         let (reconfig_events, _) = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Publish the on chain config updates
@@ -441,16 +484,16 @@ mod tests {
     }
 
     #[test]
-    fn test_pub_sub_vm_publishing_option() {
+    fn test_pub_sub_diem_version() {
         let (subscription, mut reconfig_receiver) =
-            ReconfigSubscription::subscribe_all("", vec![VMPublishingOption::CONFIG_ID], vec![]);
+            ReconfigSubscription::subscribe_all("", vec![DiemVersion::CONFIG_ID], vec![]);
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer, and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer, and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, vm_publishing_option) = create_new_allowlist_transaction(1);
+        let allowlist_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the reconfig block
         let block = vec![dummy_txn, allowlist_txn];
@@ -463,27 +506,27 @@ mod tests {
 
         // Verify the correct reconfig notification is sent
         let payload = reconfig_receiver.select_next_some().now_or_never().unwrap();
-        let received_config = payload.get::<VMPublishingOption>().unwrap();
-        assert_eq!(received_config, vm_publishing_option);
+        let received_config = payload.get::<DiemVersion>().unwrap();
+        assert_eq!(received_config, DiemVersion { major: 7 });
     }
 
     #[test]
     fn test_pub_sub_with_executor_proxy() {
         let (subscription, mut reconfig_receiver) = ReconfigSubscription::subscribe_all(
             "",
-            vec![ValidatorSet::CONFIG_ID, VMPublishingOption::CONFIG_ID],
+            vec![ValidatorSet::CONFIG_ID, DiemVersion::CONFIG_ID],
             vec![],
         );
         let (validators, mut block_executor, mut executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn_1 = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the reconfig block
-        let block = vec![dummy_txn_1.clone(), allowlist_txn.clone()];
+        let block = vec![dummy_txn_1.clone(), reconfig_txn.clone()];
         let (_, ledger_info_epoch_1) = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Give the validator some money so it can send a rotation tx, create another dummy prologue
@@ -498,7 +541,7 @@ mod tests {
 
         // Grab the first two executed transactions and verify responses
         let txns = executor_proxy.get_chunk(0, 2, 2).unwrap();
-        assert_eq!(txns.transactions, vec![dummy_txn_1, allowlist_txn]);
+        assert_eq!(txns.transactions, vec![dummy_txn_1, reconfig_txn]);
         assert!(executor_proxy
             .execute_chunk(txns, ledger_info_epoch_1.clone(), None)
             .is_ok());
@@ -536,19 +579,19 @@ mod tests {
     fn test_pub_sub_with_executor_sync_state() {
         let (subscription, mut reconfig_receiver) = ReconfigSubscription::subscribe_all(
             "",
-            vec![ValidatorSet::CONFIG_ID, VMPublishingOption::CONFIG_ID],
+            vec![ValidatorSet::CONFIG_ID, DiemVersion::CONFIG_ID],
             vec![],
         );
         let (validators, mut block_executor, executor_proxy) =
             bootstrap_genesis_and_set_subscription(subscription, &mut reconfig_receiver);
 
-        // Create a dummy prologue transaction that will bump the timer and update the VMPublishingOption
+        // Create a dummy prologue transaction that will bump the timer and update the Diem version
         let validator_account = validators[0].owner_address;
         let dummy_txn = create_dummy_transaction(1, validator_account);
-        let (allowlist_txn, _) = create_new_allowlist_transaction(1);
+        let reconfig_txn = create_new_update_diem_version_transaction(1);
 
         // Execute and commit the reconfig block
-        let block = vec![dummy_txn, allowlist_txn];
+        let block = vec![dummy_txn, reconfig_txn];
         let _ = execute_and_commit_block(&mut block_executor, block, 1);
 
         // Verify executor proxy sync state
@@ -635,7 +678,7 @@ mod tests {
 
     /// Creates a dummy transaction (useful for bumping the timer).
     fn create_dummy_transaction(index: u8, validator_account: AccountAddress) -> Transaction {
-        encode_block_prologue_script(BlockMetadata::new(
+        Transaction::BlockMetadata(BlockMetadata::new(
             gen_block_id(index),
             index as u64,
             (index as u64 + 1) * 100000010,
@@ -644,32 +687,18 @@ mod tests {
         ))
     }
 
-    /// Creates a transaction that updates the on chain allowlist.
-    fn create_new_allowlist_transaction(
-        sequencer_number: u64,
-    ) -> (Transaction, VMPublishingOption) {
-        // Add a new script to the allowlist
-        let new_allowlist = {
-            let mut existing_list = StdlibScript::allowlist();
-            existing_list.push(*HashValue::sha3_256_of(&[]).as_ref());
-            existing_list
-        };
-        let vm_publishing_option = VMPublishingOption::locked(new_allowlist);
-
-        // Create a transaction for the new allowlist
+    /// Creates a transaction that creates a reconfiguration event by changing the Diem version
+    fn create_new_update_diem_version_transaction(sequence_number: u64) -> Transaction {
         let genesis_key = vm_genesis::GENESIS_KEYPAIR.0.clone();
-        let txn = get_test_signed_transaction(
+        get_test_signed_transaction(
             diem_root_address(),
-            /* sequence_number = */ sequencer_number,
+            sequence_number,
             genesis_key.clone(),
             genesis_key.public_key(),
-            Some(encode_add_to_script_allow_list_script(
-                HashValue::sha3_256_of(&[]).to_vec(),
-                0,
+            Some(encode_update_diem_version_script(
+                0, 7, // version
             )),
-        );
-
-        (txn, vm_publishing_option)
+        )
     }
 
     /// Creates a transaction that sends funds to the specified validator account.

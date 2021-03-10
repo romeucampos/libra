@@ -1,9 +1,9 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use move_model::model::VerificationScope;
-use once_cell::sync::Lazy;
+use move_model::model::{GlobalEnv, VerificationScope};
 use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -43,8 +43,6 @@ pub struct ProverOptions {
     pub num_instances: usize,
     /// Whether to run Boogie instances sequentially.
     pub sequential_task: bool,
-    /// Run negative verification checks.
-    pub negative_checks: bool,
 }
 
 impl Default for ProverOptions {
@@ -65,9 +63,15 @@ impl Default for ProverOptions {
             dump_bytecode: false,
             num_instances: 1,
             sequential_task: false,
-            negative_checks: false,
         }
     }
 }
 
-pub static PROVER_DEFAULT_OPTIONS: Lazy<ProverOptions> = Lazy::new(ProverOptions::default);
+impl ProverOptions {
+    pub fn get(env: &GlobalEnv) -> Rc<ProverOptions> {
+        if !env.has_extension::<ProverOptions>() {
+            env.set_extension(ProverOptions::default())
+        }
+        env.get_extension::<ProverOptions>().unwrap()
+    }
+}

@@ -23,10 +23,9 @@ use diem_crypto::x25519::PublicKey;
 use diem_infallible::RwLock;
 use diem_logger::prelude::*;
 use diem_metrics::IntCounterVec;
-use diem_network_address::NetworkAddress;
 use diem_network_address_encryption::Encryptor;
 use diem_time_service::TimeService;
-use diem_types::chain_id::ChainId;
+use diem_types::{chain_id::ChainId, network_address::NetworkAddress};
 use network::{
     connectivity_manager::{builder::ConnectivityManagerBuilder, ConnectivityRequest},
     logging::NetworkSchema,
@@ -179,8 +178,8 @@ impl NetworkBuilder {
         };
 
         let network_context = Arc::new(NetworkContext::new(
-            config.network_id.clone(),
             role,
+            config.network_id.clone(),
             peer_id,
         ));
 
@@ -340,7 +339,8 @@ impl NetworkBuilder {
         channel_size: usize,
     ) -> &mut Self {
         let pm_conn_mgr_notifs_rx = self.add_connection_event_listener();
-        let outbound_connection_limit = if let RoleType::FullNode = self.network_context.role() {
+        let outbound_connection_limit = if !self.network_context.network_id().is_validator_network()
+        {
             Some(max_outbound_connections)
         } else {
             None

@@ -30,10 +30,11 @@ use diem_types::{
     transaction::{
         authenticator::AuthenticationKey,
         helpers::{create_unsigned_txn, create_user_txn, TransactionSigner},
-        parse_transaction_argument, Module, RawTransaction, Script, SignedTransaction,
+        parse_transaction_argument, ChangeSet, Module, RawTransaction, Script, SignedTransaction,
         TransactionArgument, TransactionPayload, Version, WriteSetPayload,
     },
     waypoint::Waypoint,
+    write_set::{WriteOp, WriteSetMut},
 };
 use diem_wallet::{io_utils, WalletLibrary};
 use num_traits::{
@@ -242,7 +243,8 @@ impl ClientProxy {
 
     /// Returns the ledger info corresonding to the latest epoch change
     /// (could further be used for e.g., generating a waypoint)
-    pub fn latest_epoch_change_li(&self) -> Option<&LedgerInfoWithSignatures> {
+    pub fn latest_epoch_change_li(&mut self) -> Option<&LedgerInfoWithSignatures> {
+        self.client.update_and_verify_state_proof().unwrap();
         self.client.latest_epoch_change_li()
     }
 
@@ -592,35 +594,6 @@ impl ClientProxy {
         }
     }
 
-    /// Add a hash to the allowlist that could be executed by the network.
-    pub fn add_to_script_allow_list(
-        &mut self,
-        space_delim_strings: &[&str],
-        is_blocking: bool,
-    ) -> Result<()> {
-        ensure!(
-            space_delim_strings[0] == "add_to_script_allow_list" || space_delim_strings[0] == "a",
-            "inconsistent command '{}' for add_to_script_allow_list",
-            space_delim_strings[0]
-        );
-        ensure!(
-            space_delim_strings.len() == 2,
-            "Invalid number of arguments for adding hash to script whitelist"
-        );
-        match self.diem_root_account {
-            Some(_) => self.association_transaction_with_local_diem_root_account(
-                TransactionPayload::Script(
-                    transaction_builder::encode_add_to_script_allow_list_script(
-                        hex::decode(space_delim_strings[1])?,
-                        self.diem_root_account.as_ref().unwrap().sequence_number,
-                    ),
-                ),
-                is_blocking,
-            ),
-            None => unimplemented!(),
-        }
-    }
-
     /// Modify the stored DiemVersion on chain.
     pub fn change_diem_version(
         &mut self,
@@ -667,7 +640,7 @@ impl ClientProxy {
         match self.diem_root_account {
             Some(_) => self.association_transaction_with_local_diem_root_account(
                 TransactionPayload::WriteSet(WriteSetPayload::Direct(
-                    transaction_builder::encode_stdlib_upgrade_transaction(StdLibOptions::Fresh),
+                    encode_stdlib_upgrade_transaction(StdLibOptions::Fresh),
                 )),
                 is_blocking,
             ),
@@ -1021,7 +994,8 @@ impl ClientProxy {
     }
 
     /// Get the latest version
-    pub fn get_latest_version(&self) -> Version {
+    pub fn get_latest_version(&mut self) -> Version {
+        self.client.update_and_verify_state_proof().unwrap();
         self.client.trusted_state().latest_version()
     }
 
@@ -1278,7 +1252,11 @@ impl ClientProxy {
         address: &AccountAddress,
     ) -> Result<Option<views::AccountView>> {
         let account = self.client.get_account(address)?;
-        self.client.update_and_verify_state_proof()?;
+        // This isn't used by anything except to keep track of the current version and to simulate
+        // some potential verifiable clients, which is yet to be implemented. It also has some
+        // challenges in handling retries if the upstream hasn't yet arrived at the expected
+        // version and breaks with our testnet deployment, so disabling this for now.
+        // self.client.update_and_verify_state_proof()?;
 
         if let Some(ref ac) = account.as_ref() {
             self.update_account_seq(address, ac.sequence_number)
@@ -1604,6 +1582,23 @@ impl ClientProxy {
             self.chain_id,
         )
     }
+}
+
+// Update WriteSet
+fn encode_stdlib_upgrade_transaction(option: StdLibOptions) -> ChangeSet {
+    let mut write_set = WriteSetMut::new(vec![]);
+    let stdlib_modules = compiled_stdlib::stdlib_modules(option);
+    let bytes = stdlib_modules.bytes_vec();
+    for (module, bytes) in stdlib_modules.compiled_modules.iter().zip(bytes) {
+        write_set.push((
+            AccessPath::code_access_path(module.self_id()),
+            WriteOp::Value(bytes),
+        ));
+    }
+    ChangeSet::new(
+        write_set.freeze().expect("Failed to create writeset"),
+        vec![],
+    )
 }
 
 fn parse_transaction_argument_for_client(s: &str) -> Result<TransactionArgument> {

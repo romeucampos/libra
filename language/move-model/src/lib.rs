@@ -10,14 +10,13 @@ use itertools::Itertools;
 use log::warn;
 
 use builder::module_builder::ModuleBuilder;
-use move_ir_types::location::Spanned;
 use move_lang::{
     compiled_unit::{self, CompiledUnit},
     errors::Errors,
     expansion::ast::{ModuleDefinition, Program},
     move_continue_up_to, move_parse,
-    parser::ast::{ModuleIdent, ModuleIdent_},
-    shared::{unique_map::UniqueMap, Address, Name},
+    parser::ast::ModuleIdent,
+    shared::{unique_map::UniqueMap, Address},
     Pass as MovePass, PassResult as MovePassResult,
 };
 use vm::{
@@ -106,7 +105,7 @@ pub fn run_model_builder(
 
     // Now that it is known that the program has no errors, run the spec checker on verified units
     // plus expanded AST. This will populate the environment including any errors.
-    run_spec_checker(&mut env, verified_units, expansion_ast)?;
+    run_spec_checker(&mut env, verified_units, expansion_ast);
     Ok(env)
 }
 
@@ -167,11 +166,7 @@ fn add_move_lang_errors(env: &mut GlobalEnv, errors: Errors) {
 }
 
 #[allow(deprecated)]
-fn run_spec_checker(
-    env: &mut GlobalEnv,
-    units: Vec<CompiledUnit>,
-    mut eprog: Program,
-) -> anyhow::Result<()> {
+fn run_spec_checker(env: &mut GlobalEnv, units: Vec<CompiledUnit>, mut eprog: Program) {
     let mut builder = ModelBuilder::new(env);
     // Merge the compiled units with the expanded program, preserving the order of the compiled
     // units which is topological w.r.t. use relation.
@@ -221,16 +216,10 @@ fn run_spec_checker(
                         }
                     };
                     // Convert the script into a module.
-                    let ident = ModuleIdent(Spanned {
-                        loc,
-                        value: ModuleIdent_ {
-                            name: move_lang::parser::ast::ModuleName(Name {
-                                loc,
-                                value: function_name.0.value.clone(),
-                            }),
-                            address: Address::default(),
-                        },
-                    });
+                    let ident = ModuleIdent {
+                        locs: (loc, loc),
+                        value: (Address::default(), function_name.0.value.clone()),
+                    };
                     let mut function_infos = UniqueMap::new();
                     function_infos
                         .add(function_name.clone(), function_info)
@@ -241,6 +230,7 @@ fn run_spec_checker(
                     let expanded_module = ModuleDefinition {
                         loc,
                         is_source_module: true,
+                        friends: UniqueMap::new(),
                         structs: UniqueMap::new(),
                         constants,
                         functions,
@@ -257,11 +247,8 @@ fn run_spec_checker(
     {
         let loc = builder.to_loc(&expanded_module.loc);
         let module_name = ModuleName::from_str(
-            &module_id.0.value.address.to_string(),
-            builder
-                .env
-                .symbol_pool()
-                .make(&module_id.0.value.name.0.value),
+            &module_id.value.0.to_string(),
+            builder.env.symbol_pool().make(&module_id.value.1),
         );
         let module_id = ModuleId::new(module_count);
         let mut module_translator = ModuleBuilder::new(&mut builder, module_id, module_name);
@@ -275,7 +262,6 @@ fn run_spec_checker(
     }
     // After all specs have been processed, warn about any unused schemas.
     builder.warn_unused_schemas();
-    Ok(())
 }
 
 // =================================================================================================

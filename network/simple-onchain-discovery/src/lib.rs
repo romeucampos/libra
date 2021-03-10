@@ -3,7 +3,7 @@
 
 use channel::diem_channel::{self, Receiver};
 use diem_config::{
-    config::{Peer, PeerRole, RoleType},
+    config::{Peer, PeerRole},
     network_id::NetworkContext,
 };
 use diem_crypto::x25519::PublicKey;
@@ -21,6 +21,7 @@ use network::{
     logging::NetworkSchema,
 };
 use once_cell::sync::Lazy;
+use short_hex_str::AsShortHexStr;
 use std::{collections::HashSet, sync::Arc};
 use subscription_service::ReconfigSubscription;
 
@@ -87,7 +88,7 @@ fn extract_updates(
     encryptor: &Encryptor,
     node_set: ValidatorSet,
 ) -> Vec<ConnectivityRequest> {
-    let role = network_context.role();
+    let is_validator = network_context.network_id().is_validator_network();
 
     // Decode addresses while ignoring bad addresses
     let discovered_peers = node_set
@@ -96,20 +97,19 @@ fn extract_updates(
             let peer_id = *info.account_address();
             let config = info.into_config();
 
-            let addrs = match role {
-                RoleType::Validator => {
-                    let result = encryptor.decrypt(&config.validator_network_addresses, peer_id);
-                    if let Err(EncryptorError::StorageError(_)) = result {
-                        panic!(format!(
-                            "Unable to initialize validator network addresses: {:?}",
-                            result
-                        ));
-                    }
-                    result.map_err(anyhow::Error::from)
+            let addrs = if is_validator {
+                let result = encryptor.decrypt(&config.validator_network_addresses, peer_id);
+                if let Err(EncryptorError::StorageError(_)) = result {
+                    panic!(format!(
+                        "Unable to initialize validator network addresses: {:?}",
+                        result
+                    ));
                 }
-                RoleType::FullNode => config
+                result.map_err(anyhow::Error::from)
+            } else {
+                config
                     .fullnode_network_addresses()
-                    .map_err(anyhow::Error::from),
+                    .map_err(anyhow::Error::from)
             }
             .map_err(|err| {
                 inc_by_with_context(&DISCOVERY_COUNTS, &network_context, "read_failure", 1);
@@ -123,9 +123,10 @@ fn extract_updates(
             })
             .unwrap_or_default();
 
-            let peer_role = match role {
-                RoleType::Validator => PeerRole::Validator,
-                RoleType::FullNode => PeerRole::ValidatorFullNode,
+            let peer_role = if is_validator {
+                PeerRole::Validator
+            } else {
+                PeerRole::ValidatorFullNode
             };
             (peer_id, Peer::from_addrs(peer_role, addrs))
         })
@@ -215,7 +216,7 @@ impl ConfigurationChangeListener {
         info!(
             NetworkSchema::new(&self.network_context),
             "Update {} Network about new Node IDs",
-            self.network_context.role()
+            self.network_context.network_id()
         );
 
         for update in updates {
@@ -264,10 +265,9 @@ mod tests {
         x25519::PrivateKey,
         PrivateKey as PK, Uniform,
     };
-    use diem_network_address::NetworkAddress;
     use diem_types::{
-        on_chain_config::OnChainConfig, validator_config::ValidatorConfig,
-        validator_info::ValidatorInfo, PeerId,
+        network_address::NetworkAddress, on_chain_config::OnChainConfig,
+        validator_config::ValidatorConfig, validator_info::ValidatorInfo, PeerId,
     };
     use futures::executor::block_on;
     use rand::{rngs::StdRng, SeedableRng};
@@ -285,7 +285,7 @@ mod tests {
         let consensus_pubkey = consensus_private_key.public_key();
         let pubkey = test_pubkey([0u8; 32]);
         let different_pubkey = test_pubkey([1u8; 32]);
-        let peer_id = PeerId::from_identity_public_key(pubkey);
+        let peer_id = diem_types::account_address::from_identity_public_key(pubkey);
 
         // Build up the Reconfig Listener
         let (conn_mgr_reqs_tx, _rx) = channel::new_test(1);

@@ -44,6 +44,7 @@ use futures::{
     FutureExt, SinkExt, TryFutureExt,
 };
 use serde::Serialize;
+use short_hex_str::AsShortHexStr;
 use std::{fmt, panic, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 use tokio_util::compat::{
@@ -509,8 +510,8 @@ where
         }
     }
 
-    async fn handle_outbound_request<'a>(
-        &'a mut self,
+    async fn handle_outbound_request(
+        &mut self,
         request: PeerRequest,
         write_reqs_tx: &mut channel::Sender<(
             NetworkMessage,

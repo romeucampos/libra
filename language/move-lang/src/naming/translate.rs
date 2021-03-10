@@ -49,11 +49,11 @@ impl Context {
         use ResolvedType as RT;
         let scoped_types = prog
             .modules
-            .iter()
+            .key_cloned_iter()
             .map(|(mident, mdef)| {
                 let mems = mdef
                     .structs
-                    .iter()
+                    .key_cloned_iter()
                     .map(|(s, sdef)| {
                         let kopt = sdef.resource_opt.map(|l| sp(l, Kind_::Resource));
                         let arity = sdef.type_parameters.len();
@@ -66,24 +66,24 @@ impl Context {
             .collect();
         let scoped_functions = prog
             .modules
-            .iter()
+            .key_cloned_iter()
             .map(|(mident, mdef)| {
                 let mems = mdef
                     .functions
                     .iter()
-                    .map(|(n, _)| (n.value().to_string(), n.loc()))
+                    .map(|(nloc, n, _)| (n.clone(), nloc))
                     .collect();
                 (mident, mems)
             })
             .collect();
         let scoped_constants = prog
             .modules
-            .iter()
+            .key_cloned_iter()
             .map(|(mident, mdef)| {
                 let mems = mdef
                     .constants
                     .iter()
-                    .map(|(n, _)| (n.value().to_string(), n.loc()))
+                    .map(|(nloc, n, _)| (n.clone(), nloc))
                     .collect();
                 (mident, mems)
             })
@@ -114,6 +114,17 @@ impl Context {
 
     fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+
+    fn resolve_module(&mut self, loc: Loc, m: &ModuleIdent) -> bool {
+        // NOTE: piggybacking on `scoped_functions` to provide a set of modules in the context。
+        // TODO: a better solution would be to have a single `BTreeMap<ModuleIdent, ModuleInfo>`
+        // in the context that can be used to resolve modules, types, and functions.
+        let resolved = self.scoped_functions.contains_key(m);
+        if !resolved {
+            self.error(vec![(loc, format!("Unbound module '{}'", m,))]);
+        }
+        resolved
     }
 
     fn resolve_module_type(
@@ -325,6 +336,9 @@ fn module(
 ) -> N::ModuleDefinition {
     context.current_module = Some(ident);
     let is_source_module = mdef.is_source_module;
+    let friends = mdef
+        .friends
+        .filter_map(|mident, f| friend(context, mident, f));
     let unscoped = context.save_unscoped();
     let structs = mdef.structs.map(|name, s| {
         context.restore_unscoped(unscoped.clone());
@@ -342,6 +356,7 @@ fn module(
     N::ModuleDefinition {
         is_source_module,
         dependency_order: 0,
+        friends,
         structs,
         functions,
         constants,
@@ -367,9 +382,8 @@ fn script(context: &mut Context, escript: E::Script) -> N::Script {
         specs: _specs,
     } = escript;
     let outer_unscoped = context.save_unscoped();
-    for (n, _) in &econstants {
-        let sp!(loc, s) = n.0;
-        context.bind_constant(s, loc)
+    for (loc, s, _) in &econstants {
+        context.bind_constant(s.clone(), loc)
     }
     let inner_unscoped = context.save_unscoped();
     let constants = econstants.map(|name, c| {
@@ -384,6 +398,35 @@ fn script(context: &mut Context, escript: E::Script) -> N::Script {
         constants,
         function_name,
         function,
+    }
+}
+
+//**************************************************************************************************
+// Friends
+//**************************************************************************************************
+fn friend(context: &mut Context, mident: ModuleIdent, loc: Loc) -> Option<Loc> {
+    let current_mident = context.current_module.as_ref().unwrap();
+    if mident.value.0 != current_mident.value.0 {
+        // NOTE: in alignment with the bytecode verifier, this constraint is a policy decision
+        // rather than a technical requirement. The compiler, VM, and bytecode verifier DO NOT
+        // rely on the assumption that friend modules must reside within the same account address.
+        let msg = "Cannot declare modules out of the current address as a friend";
+        context.error(vec![
+            (loc, "Invalid friend declaration"),
+            (mident.loc(), msg),
+        ]);
+        None
+    } else if &mident == current_mident {
+        context.error(vec![
+            (loc, "Invalid friend declaration"),
+            (mident.loc(), "Cannot declare the module itself as a friend"),
+        ]);
+        None
+    } else if context.resolve_module(loc, &mident) {
+        Some(loc)
+    } else {
+        assert!(context.has_errors());
+        None
     }
 }
 
@@ -520,7 +563,7 @@ fn struct_def(
     match (&resource_opt, &fields) {
         (Some(_), _) | (_, N::StructFields::Native(_)) => (),
         (None, N::StructFields::Defined(fields)) => {
-            for (field, idx_ty) in fields.iter() {
+            for (field, idx_ty) in fields.key_cloned_iter() {
                 check_no_nominal_resources(context, &name, &field, &idx_ty.1);
             }
         }
@@ -614,7 +657,7 @@ fn type_parameters(context: &mut Context, type_parameters: Vec<(Name, Kind)>) ->
                 name.value.to_string(),
                 ResolvedType::TParam(loc, tp.clone()),
             );
-            if let Err(old_loc) = unique_tparams.add(name.clone(), ()) {
+            if let Err((name, old_loc)) = unique_tparams.add(name, ()) {
                 let msg = format!("Duplicate type parameter declared with name '{}'", name);
                 context.error(vec![
                     (loc, msg),

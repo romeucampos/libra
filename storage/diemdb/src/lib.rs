@@ -429,7 +429,7 @@ impl DiemDB {
     }
 
     // ================================== Private APIs ==================================
-    fn get_events_by_event_key(
+    fn get_events_with_proof_by_event_key(
         &self,
         event_key: &EventKey,
         start_seq_num: u64,
@@ -454,7 +454,7 @@ impl DiemDB {
         let (first_seq, real_limit) = get_first_seq_num_and_limit(order, cursor, limit)?;
 
         // Query the index.
-        let mut event_keys = self.event_store.lookup_events_by_key(
+        let mut event_indices = self.event_store.lookup_events_by_key(
             &event_key,
             first_seq,
             real_limit,
@@ -468,14 +468,14 @@ impl DiemDB {
         // 90, we will get 90 to 100 from the index lookup above. Seeing that the last item
         // is 100 instead of 110 tells us 110 is out of bound.
         if order == Order::Descending {
-            if let Some((seq_num, _, _)) = event_keys.last() {
+            if let Some((seq_num, _, _)) = event_indices.last() {
                 if *seq_num < cursor {
-                    event_keys = Vec::new();
+                    event_indices = Vec::new();
                 }
             }
         }
 
-        let mut events_with_proof = event_keys
+        let mut events_with_proof = event_indices
             .into_iter()
             .map(|(seq, ver, idx)| {
                 let (event, event_proof) = self
@@ -551,12 +551,12 @@ impl DiemDB {
             .collect::<Result<Vec<_>>>()?;
 
         // Transaction updates. Gather transaction hashes.
-        zip_eq(first_version..=last_version, txns_to_commit)
-            .map(|(ver, txn_to_commit)| {
+        zip_eq(first_version..=last_version, txns_to_commit).try_for_each(
+            |(ver, txn_to_commit)| {
                 self.transaction_store
                     .put_transaction(ver, txn_to_commit.transaction(), &mut cs)
-            })
-            .collect::<Result<()>>()?;
+            },
+        )?;
 
         // Transaction accumulator updates. Get result root hash.
         let txn_infos = izip!(txns_to_commit, state_root_hashes, event_root_hashes)
@@ -737,7 +737,8 @@ impl DbReader for DiemDB {
                     .ledger_info()
                     .version();
             }
-            let events = self.get_events_by_event_key(event_key, start, order, limit, version)?;
+            let events =
+                self.get_events_with_proof_by_event_key(event_key, start, order, limit, version)?;
             Ok(events)
         })
     }
@@ -894,6 +895,17 @@ impl DbReader for DiemDB {
                 None => 0,
             };
             Ok(ts)
+        })
+    }
+
+    fn get_last_version_before_timestamp(
+        &self,
+        timestamp: u64,
+        ledger_version: Version,
+    ) -> Result<Version> {
+        gauged_api("get_last_version_before_timestamp", || {
+            self.event_store
+                .get_last_version_before_timestamp(timestamp, ledger_version)
         })
     }
 

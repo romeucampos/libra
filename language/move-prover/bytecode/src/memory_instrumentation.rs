@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    borrow_analysis::BorrowAnnotation,
+    borrow_analysis::{BorrowAnnotation, EdgeDomain},
     function_target::{FunctionData, FunctionTarget},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder},
     stackless_bytecode::{
-        AttrId, BorrowNode,
+        AttrId, BorrowEdge, BorrowNode,
         Bytecode::{self, *},
         Operation,
     },
@@ -111,7 +111,7 @@ impl<'a> Instrumenter<'a> {
     ) -> (Vec<Bytecode>, Vec<Bytecode>) {
         let mut before = vec![];
         let mut after = vec![];
-        if let Call(attr_id, _, Operation::Function(mid, fid, _), srcs) = bytecode {
+        if let Call(attr_id, _, Operation::Function(mid, fid, _), srcs, _) = bytecode {
             let callee_env = self
                 .func_target
                 .module_env()
@@ -132,6 +132,7 @@ impl<'a> Instrumenter<'a> {
                                 vec![],
                                 Operation::PackRef,
                                 vec![**idx],
+                                None,
                             )
                         })
                         .collect(),
@@ -145,6 +146,7 @@ impl<'a> Instrumenter<'a> {
                                 vec![],
                                 Operation::UnpackRef,
                                 vec![*idx],
+                                None,
                             )
                         })
                         .collect(),
@@ -202,7 +204,7 @@ impl<'a> Instrumenter<'a> {
         let mut instrumented_bytecodes = vec![];
 
         // Generate UnpackRef from Borrow instructions.
-        if let Call(attr_id, dests, op, _) = bytecode {
+        if let Call(attr_id, dests, op, _, _) = bytecode {
             use Operation::*;
             match op {
                 BorrowLoc | BorrowField(..) | BorrowGlobal(..) => {
@@ -221,6 +223,7 @@ impl<'a> Instrumenter<'a> {
                                 Operation::UnpackRef
                             },
                             vec![dests[0]],
+                            None,
                         ));
                     }
                 }
@@ -251,17 +254,32 @@ impl<'a> Instrumenter<'a> {
                                 Operation::PackRef
                             },
                             vec![*idx],
+                            None,
                         ));
                     }
                 }
                 // Generate write_back for this reference.
-                for parent in before.get_parents(&node) {
-                    instrumented_bytecodes.push(Bytecode::Call(
-                        self.clone_attr(attr_id),
-                        vec![],
-                        Operation::WriteBack(parent.clone()),
-                        vec![*idx],
-                    ));
+                for (parent, edge_dom_ele) in before.get_incoming(&node) {
+                    match edge_dom_ele {
+                        EdgeDomain::Top => instrumented_bytecodes.push(Bytecode::Call(
+                            self.clone_attr(attr_id),
+                            vec![],
+                            Operation::WriteBack(parent.clone(), BorrowEdge::Weak),
+                            vec![*idx],
+                            None,
+                        )),
+                        EdgeDomain::EdgeSet(edges) => {
+                            for edge in edges {
+                                instrumented_bytecodes.push(Bytecode::Call(
+                                    self.clone_attr(attr_id),
+                                    vec![],
+                                    Operation::WriteBack(parent.clone(), BorrowEdge::Strong(edge)),
+                                    vec![*idx],
+                                    None,
+                                ))
+                            }
+                        }
+                    }
                 }
             }
         }

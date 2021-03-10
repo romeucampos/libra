@@ -10,7 +10,7 @@ use crate::{
     },
     parser::ast::{
         self as P, ConstantName, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent,
-        ModuleIdent_, ModuleName, StructName, Var,
+        ModuleName, StructName, Var,
     },
     shared::{unique_map::UniqueMap, *},
 };
@@ -193,7 +193,7 @@ fn module(
     assert!(context.address == None);
     set_sender_address(context, module_def.loc, address);
     let (mident, mod_) = module_(context, module_def);
-    if let Err((old_loc, _)) = module_map.add(mident.clone(), mod_) {
+    if let Err((mident, (old_loc, _))) = module_map.add(mident, mod_) {
         let mmsg = format!("Duplicate definition for module '{}'", mident);
         context.error(vec![
             (mident.loc(), mmsg),
@@ -223,12 +223,12 @@ fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E:
     let P::ModuleDefinition { loc, name, members } = mdef;
     let _ = check_restricted_self_name(context, "module", &name.0);
 
-    let name_loc = name.loc();
-    let mident_ = ModuleIdent_ {
-        address: context.cur_address(),
-        name,
+    let name = name.0;
+    let name_loc = name.loc;
+    let current_module = ModuleIdent {
+        locs: (name_loc, name_loc),
+        value: (context.cur_address(), name.value),
     };
-    let current_module = ModuleIdent(sp(name_loc, mident_));
 
     let mut new_scope = AliasMap::new();
     module_self_aliases(&mut new_scope, &current_module);
@@ -242,6 +242,7 @@ fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E:
         "ICE there should be no aliases entering a module"
     );
 
+    let mut friends = UniqueMap::new();
     let mut functions = UniqueMap::new();
     let mut constants = UniqueMap::new();
     let mut structs = UniqueMap::new();
@@ -249,6 +250,7 @@ fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E:
     for member in members {
         match member {
             P::ModuleMember::Use(_) => unreachable!(),
+            P::ModuleMember::Friend(f) => friend(context, &mut friends, f),
             P::ModuleMember::Function(mut f) => {
                 if !context.is_source_module {
                     f.body.value = P::FunctionBody_::Native
@@ -265,6 +267,7 @@ fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E:
     let def = E::ModuleDefinition {
         loc,
         is_source_module: context.is_source_module,
+        friends,
         structs,
         constants,
         functions,
@@ -304,9 +307,18 @@ fn script_(context: &mut Context, pscript: P::Script) -> E::Script {
     }
 
     let (function_name, function) = function_(context, pfunction);
-    if let FunctionVisibility::Public(loc) = &function.visibility {
-        let msg = "Extraneous 'public' modifier. Script functions are always public";
-        context.error(vec![(*loc, msg)]);
+    match &function.visibility {
+        FunctionVisibility::Public(loc)
+        | FunctionVisibility::Script(loc)
+        | FunctionVisibility::Friend(loc) => {
+            let msg = format!(
+                "Extraneous '{}' modifier. Script functions are always '{}'",
+                function.visibility,
+                FunctionVisibility::SCRIPT,
+            );
+            context.error(vec![(*loc, msg)]);
+        }
+        FunctionVisibility::Internal => (),
     }
     match &function.body {
         sp!(_, E::FunctionBody_::Defined(_)) => (),
@@ -354,11 +366,10 @@ fn module_members(
     address: Address,
     m: &P::ModuleDefinition,
 ) {
-    let mident_ = ModuleIdent_ {
-        address,
-        name: m.name.clone(),
+    let mident = ModuleIdent {
+        locs: (m.name.loc(), m.name.loc()),
+        value: (address, m.name.value().to_string()),
     };
-    let mident = ModuleIdent(sp(m.name.loc(), mident_));
     let mut cur_members = members.remove(&mident).unwrap_or_else(ModuleMembers::new);
     for mem in &m.members {
         use P::{SpecBlockMember_ as SBM, SpecBlockTarget_ as SBT, SpecBlock_ as SB};
@@ -372,7 +383,16 @@ fn module_members(
             P::ModuleMember::Struct(s) => {
                 cur_members.insert(s.name.0.clone(), ModuleMemberKind::Struct);
             }
-            P::ModuleMember::Spec(sp!(_, SB { target, members, .. })) => match &target.value {
+            P::ModuleMember::Spec(
+                sp!(
+                    _,
+                    SB {
+                        target,
+                        members,
+                        ..
+                    }
+                ),
+            ) => match &target.value {
                 SBT::Schema(n, _) => {
                     cur_members.insert(n.clone(), ModuleMemberKind::Schema);
                 }
@@ -385,7 +405,7 @@ fn module_members(
                 }
                 _ => (),
             },
-            P::ModuleMember::Use(_) => (),
+            P::ModuleMember::Use(_) | P::ModuleMember::Friend(_) => (),
         };
     }
     members.add(mident, cur_members).unwrap();
@@ -421,6 +441,10 @@ fn aliases_from_member(
             use_(context, acc, u);
             None
         }
+        f @ P::ModuleMember::Friend(_) => {
+            // friend declarations do not produce implicit aliases
+            Some(f)
+        }
         P::ModuleMember::Function(f) => {
             let n = f.name.0.clone();
             check_name_and_add_implicit_alias!(ModuleMemberKind::Function, n);
@@ -437,7 +461,14 @@ fn aliases_from_member(
             Some(P::ModuleMember::Struct(s))
         }
         P::ModuleMember::Spec(s) => {
-            let sp!(_, SB { target, members, .. }) = &s;
+            let sp!(
+                _,
+                SB {
+                    target,
+                    members,
+                    ..
+                }
+            ) = &s;
             match &target.value {
                 SBT::Schema(n, _) => {
                     check_name_and_add_implicit_alias!(ModuleMemberKind::Schema, n.clone());
@@ -466,7 +497,8 @@ fn use_(context: &mut Context, acc: &mut AliasMap, u: P::Use) {
     };
     macro_rules! add_module_alias {
         ($ident:expr, $alias_opt:expr) => {{
-            let alias: Name = $alias_opt.unwrap_or_else(|| $ident.0.value.name.0.clone());
+            let alias: Name =
+                $alias_opt.unwrap_or_else(|| sp($ident.locs.1, $ident.value.1.clone()));
             if let Err(()) = check_restricted_self_name(context, "module alias", &alias) {
                 return;
             }
@@ -622,7 +654,7 @@ fn struct_fields(
     let mut field_map = UniqueMap::new();
     for (idx, (field, pt)) in pfields_vec.into_iter().enumerate() {
         let t = type_(context, pt);
-        if let Err(old_loc) = field_map.add(field.clone(), (idx, t)) {
+        if let Err((field, old_loc)) = field_map.add(field, (idx, t)) {
             context.error(vec![
                 (
                     field.loc(),
@@ -636,6 +668,49 @@ fn struct_fields(
         }
     }
     E::StructFields::Defined(field_map)
+}
+
+//**************************************************************************************************
+// Friends
+//**************************************************************************************************
+
+fn friend(context: &mut Context, friends: &mut UniqueMap<ModuleIdent, Loc>, pfriend: P::Friend) {
+    match friend_(context, pfriend) {
+        Some((mident, loc)) => {
+            if let Err((mident, (old_friend_loc, _))) = friends.add(mident, loc) {
+                let msg = format!(
+                    "Duplicate friend declaration '{}'. Friend declarations in a module must be unique",
+                    mident
+                );
+                context.error(vec![
+                    (loc, msg),
+                    (old_friend_loc, "Previously declared here".into()),
+                ]);
+            }
+        }
+        None => assert!(context.has_errors()),
+    };
+}
+
+fn friend_(context: &mut Context, sp!(loc, pfriend): P::Friend) -> Option<(ModuleIdent, Loc)> {
+    assert!(context.exp_specs.is_empty());
+    let mident_opt = match pfriend {
+        P::Friend_::Module(mname) => match context.aliases.module_alias_get(&mname.0).cloned() {
+            None => {
+                context.error(vec![(
+                    mname.loc(),
+                    format!("Unbound module alias '{}'", mname),
+                )]);
+                None
+            }
+            Some(mident) => {
+                let (_, value) = mident.drop_loc();
+                Some(ModuleIdent::add_loc((mname.loc(), mname.loc()), value))
+            }
+        },
+        P::Friend_::QualifiedModule(mident) => Some(mident),
+    };
+    mident_opt.map(|mident| (mident, loc))
 }
 
 //**************************************************************************************************
@@ -777,13 +852,7 @@ fn spec(context: &mut Context, sp!(loc, pspec): P::SpecBlock) -> E::SpecBlock {
 
     let members = pmembers
         .into_iter()
-        .filter_map(|m| {
-            let m = spec_member(context, m);
-            if m.is_none() {
-                assert!(context.has_errors())
-            };
-            m
-        })
+        .map(|m| spec_member(context, m))
         .collect();
 
     context.set_to_outer_scope(old_aliases);
@@ -792,10 +861,7 @@ fn spec(context: &mut Context, sp!(loc, pspec): P::SpecBlock) -> E::SpecBlock {
     sp(loc, E::SpecBlock_ { target, members })
 }
 
-fn spec_member(
-    context: &mut Context,
-    sp!(loc, pm): P::SpecBlockMember,
-) -> Option<E::SpecBlockMember> {
+fn spec_member(context: &mut Context, sp!(loc, pm): P::SpecBlockMember) -> E::SpecBlockMember {
     use E::SpecBlockMember_ as EM;
     use P::SpecBlockMember_ as PM;
     let em = match pm {
@@ -891,7 +957,7 @@ fn spec_member(
             EM::Pragma { properties }
         }
     };
-    Some(sp(loc, em))
+    sp(loc, em)
 }
 
 fn pragma_property(context: &mut Context, sp!(loc, pp_): P::PragmaProperty) -> E::PragmaProperty {
@@ -1185,16 +1251,20 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
                 }
             }
         }
-        PE::Quant(k, prs, pc, pe) => {
+        PE::Quant(k, prs, ptrs, pc, pe) => {
             if !context.require_spec_context(loc, "expression only allowed in specifications") {
                 assert!(context.has_errors());
                 EE::UnresolvedError
             } else {
                 let rs_opt = bind_with_range_list(context, prs);
+                let rtrs = ptrs
+                    .into_iter()
+                    .map(|trs| trs.into_iter().map(|tr| exp_(context, tr)).collect())
+                    .collect();
                 let rc = pc.map(|c| Box::new(exp_(context, *c)));
                 let re = exp_(context, *pe);
                 match rs_opt {
-                    Some(rs) => EE::Quant(k, rs, rc, Box::new(re)),
+                    Some(rs) => EE::Quant(k, rs, rtrs, rc, Box::new(re)),
                     None => {
                         assert!(context.has_errors());
                         EE::UnresolvedError
@@ -1336,7 +1406,7 @@ fn fields<T>(
 ) -> Fields<T> {
     let mut fmap = UniqueMap::new();
     for (idx, (field, x)) in xs.into_iter().enumerate() {
-        if let Err(old_loc) = fmap.add(field.clone(), (idx, x)) {
+        if let Err((field, old_loc)) = fmap.add(field, (idx, x)) {
             context.error(vec![
                 (loc, format!("Invalid {}", case)),
                 (
@@ -1564,7 +1634,7 @@ fn unbound_names_exp(unbound: &mut BTreeSet<Name>, sp!(_, e_): &E::Exp) {
             unbound.insert(n.clone());
         }
         EE::Call(_, _, sp!(_, es_)) => unbound_names_exps(unbound, es_),
-        EE::Pack(_, _, es) => unbound_names_exps(unbound, es.iter().map(|(_, (_, e))| e)),
+        EE::Pack(_, _, es) => unbound_names_exps(unbound, es.iter().map(|(_, _, (_, e))| e)),
         EE::IfElse(econd, et, ef) => {
             unbound_names_exp(unbound, ef);
             unbound_names_exp(unbound, et);
@@ -1582,10 +1652,13 @@ fn unbound_names_exp(unbound: &mut BTreeSet<Name>, sp!(_, e_): &E::Exp) {
             // remove anything in `ls`
             unbound_names_binds(unbound, ls);
         }
-        EE::Quant(_, rs, cr_opt, er) => {
+        EE::Quant(_, rs, trs, cr_opt, er) => {
             unbound_names_exp(unbound, er);
             if let Some(cr) = cr_opt {
                 unbound_names_exp(unbound, cr);
+            }
+            for tr in trs {
+                unbound_names_exps(unbound, tr);
             }
             // remove anything in `rs`
             unbound_names_binds_with_range(unbound, rs);
@@ -1671,7 +1744,7 @@ fn unbound_names_bind(unbound: &mut BTreeSet<Name>, sp!(_, l_): &E::LValue) {
         }
         EL::Unpack(_, _, efields) => efields
             .iter()
-            .for_each(|(_, (_, l))| unbound_names_bind(unbound, l)),
+            .for_each(|(_, _, (_, l))| unbound_names_bind(unbound, l)),
     }
 }
 
@@ -1692,7 +1765,7 @@ fn unbound_names_assign(unbound: &mut BTreeSet<Name>, sp!(_, l_): &E::LValue) {
         }
         EL::Unpack(_, _, efields) => efields
             .iter()
-            .for_each(|(_, (_, l))| unbound_names_assign(unbound, l)),
+            .for_each(|(_, _, (_, l))| unbound_names_assign(unbound, l)),
     }
 }
 

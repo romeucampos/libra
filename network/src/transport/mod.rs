@@ -15,9 +15,12 @@ use diem_config::{
 };
 use diem_crypto::x25519;
 use diem_logger::prelude::*;
-use diem_network_address::{parse_dns_tcp, parse_ip_tcp, parse_memory, NetworkAddress};
 use diem_time_service::{timeout, TimeService, TimeServiceTrait};
-use diem_types::{chain_id::ChainId, PeerId};
+use diem_types::{
+    chain_id::ChainId,
+    network_address::{parse_dns_tcp, parse_ip_tcp, parse_memory, NetworkAddress},
+    PeerId,
+};
 use futures::{
     future::{Future, FutureExt},
     io::{AsyncRead, AsyncWrite},
@@ -25,6 +28,7 @@ use futures::{
 };
 use netcore::transport::{proxy_protocol, tcp, ConnectionOrigin, Transport};
 use serde::Serialize;
+use short_hex_str::AsShortHexStr;
 use std::{
     collections::BTreeMap,
     convert::TryFrom,
@@ -126,14 +130,27 @@ impl ConnectionMetadata {
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn mock(remote_peer_id: PeerId) -> ConnectionMetadata {
+        Self::mock_with_role_and_origin(
+            remote_peer_id,
+            PeerRole::Unknown,
+            ConnectionOrigin::Inbound,
+        )
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn mock_with_role_and_origin(
+        remote_peer_id: PeerId,
+        role: PeerRole,
+        origin: ConnectionOrigin,
+    ) -> ConnectionMetadata {
         ConnectionMetadata {
             remote_peer_id,
+            role,
+            origin,
             connection_id: ConnectionId::default(),
             addr: NetworkAddress::mock(),
-            origin: ConnectionOrigin::Inbound,
             messaging_protocol: MessagingProtocolVersion::V1,
             application_protocols: [].iter().into(),
-            role: PeerRole::Unknown,
         }
     }
 }
@@ -430,7 +447,7 @@ where
     fn parse_dial_addr(
         addr: &NetworkAddress,
     ) -> io::Result<(NetworkAddress, x25519::PublicKey, u8)> {
-        use diem_network_address::Protocol::*;
+        use diem_types::network_address::Protocol::*;
 
         let protos = addr.as_slice();
 

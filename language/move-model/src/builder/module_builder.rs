@@ -184,8 +184,8 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
             EA::ModuleAccess_::Name(n) => (None, self.symbol_pool().make(n.value.as_str())),
             EA::ModuleAccess_::ModuleAccess(m, n) => {
                 let module_name = ModuleName::from_str(
-                    &m.0.value.address.to_string(),
-                    self.symbol_pool().make(m.0.value.name.0.value.as_str()),
+                    &m.value.0.to_string(),
+                    self.symbol_pool().make(m.value.1.as_str()),
                 );
                 (Some(module_name), self.symbol_pool().make(n.value.as_str()))
             }
@@ -251,13 +251,13 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
         compiled_module: &CompiledModule,
         source_map: &SourceMap<MoveIrLoc>,
     ) {
-        for (name, struct_def) in &module_def.structs {
+        for (name, struct_def) in module_def.structs.key_cloned_iter() {
             self.decl_ana_struct(&name, struct_def);
         }
-        for (name, fun_def) in &module_def.functions {
+        for (name, fun_def) in module_def.functions.key_cloned_iter() {
             self.decl_ana_fun(&name, fun_def);
         }
-        for (name, const_def) in &module_def.constants {
+        for (name, const_def) in module_def.constants.key_cloned_iter() {
             self.decl_ana_const(&name, const_def, compiled_module, source_map);
         }
         for spec in &module_def.specs {
@@ -531,19 +531,19 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
         function_infos: UniqueMap<PA::FunctionName, FunctionInfo>,
     ) {
         // Analyze all structs.
-        for (name, def) in &module_def.structs {
+        for (name, def) in module_def.structs.key_cloned_iter() {
             self.def_ana_struct(&name, def);
         }
 
         // Analyze all functions.
-        for (idx, (name, fun_def)) in module_def.functions.iter().enumerate() {
+        for (idx, (name, fun_def)) in module_def.functions.key_cloned_iter().enumerate() {
             self.def_ana_fun(&name, &fun_def.body, idx);
         }
 
         // Propagate the impurity of functions: a Move function which calls an
         // impure Move function is also considered impure.
         let mut visited = BTreeMap::new();
-        for (idx, (name, _)) in module_def.functions.iter().enumerate() {
+        for (idx, (name, _)) in module_def.functions.key_cloned_iter().enumerate() {
             let is_pure = self.propagate_function_impurity(&mut visited, SpecFunId::new(idx));
             let full_name = self.qualified_by_module_from_name(&name.0);
             if is_pure {
@@ -601,7 +601,7 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
         }
 
         // Analyze in-function spec blocks.
-        for (name, fun_def) in &module_def.functions {
+        for (name, fun_def) in module_def.functions.key_cloned_iter() {
             let fun_spec_info = &function_infos.get(&name).unwrap().spec_info;
             let qsym = self.qualified_by_module_from_name(&name.0);
             for (spec_id, spec_block) in fun_def.specs.iter() {
@@ -673,8 +673,8 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
         let fields = match &def.fields {
             EA::StructFields::Defined(fields) => {
                 let mut field_map = BTreeMap::new();
-                for (ref field_name, (idx, ty)) in fields.iter() {
-                    let field_sym = et.symbol_pool().make(&field_name.0.value);
+                for (_name_loc, field_name_, (idx, ty)) in fields {
+                    let field_sym = et.symbol_pool().make(field_name_);
                     let field_ty = et.translate_type(&ty);
                     field_map.insert(field_sym, (*idx, field_ty));
                 }
@@ -831,6 +831,9 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
 impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
     fn def_ana_spec_block(&mut self, context: &SpecBlockContext<'_>, block: &EA::SpecBlock) {
         use EA::SpecBlockMember_::*;
+
+        let block_loc = self.parent.env.to_loc(&block.loc);
+        self.update_spec(context, move |spec| spec.loc = Some(block_loc));
 
         assert!(self.spec_block_lets.is_empty());
 
@@ -1173,8 +1176,8 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                 }
                 if kind_opt.is_some() {
                     et.enter_scope();
-                    for (n, info) in &spec_info.used_locals {
-                        let sym = et.symbol_pool().make(n.0.value.as_str());
+                    for (_n_loc, n_, info) in &spec_info.used_locals {
+                        let sym = et.symbol_pool().make(n_);
                         let ty = et.translate_hlir_single_type(&info.type_);
                         if ty == Type::Error {
                             et.error(
@@ -1899,7 +1902,7 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                 let mut et = self.exp_translator_for_schema(&loc, context_type_params, vars);
                 let lhs_exp = et.translate_exp(lhs, &BOOL_TYPE);
                 et.finalize_types();
-                let path_cond = self.extend_path_condition(&loc, path_cond, lhs_exp);
+                let path_cond = Some(self.extend_path_condition(&loc, path_cond, lhs_exp));
                 self.def_ana_schema_exp_oper(
                     context_type_params,
                     vars,
@@ -1942,7 +1945,7 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                 let c_exp = et.translate_exp(c, &BOOL_TYPE);
                 et.finalize_types();
                 let t_path_cond =
-                    self.extend_path_condition(&loc, path_cond.clone(), c_exp.clone());
+                    Some(self.extend_path_condition(&loc, path_cond.clone(), c_exp.clone()));
                 self.def_ana_schema_exp_oper(
                     context_type_params,
                     vars,
@@ -1954,7 +1957,7 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                 );
                 let node_id = self.parent.env.new_node(loc.clone(), BOOL_TYPE.clone());
                 let not_c_exp = Exp::Call(node_id, Operation::Not, vec![c_exp]);
-                let e_path_cond = self.extend_path_condition(&loc, path_cond, not_c_exp);
+                let e_path_cond = Some(self.extend_path_condition(&loc, path_cond, not_c_exp));
                 self.def_ana_schema_exp_oper(
                     context_type_params,
                     vars,
@@ -2052,16 +2055,16 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
         let mut argument_map: BTreeMap<Symbol, Exp> = args_opt
             .map(|args| {
                 args.iter()
-                    .map(|(ref schema_var, (_, exp))| {
+                    .map(|(var_loc, schema_var_, (_, exp))| {
                         let pool = et.symbol_pool();
-                        let schema_sym = pool.make(&schema_var.0.value);
+                        let schema_sym = pool.make(schema_var_);
                         let schema_type = if let Some(LocalVarEntry { type_, .. }) =
                             schema_entry.all_vars.get(&schema_sym)
                         {
                             type_.instantiate(type_arguments)
                         } else {
                             et.error(
-                                &et.to_loc(&schema_var.0.loc),
+                                &et.to_loc(&var_loc),
                                 &format!("`{}` not declared in schema", schema_sym.display(pool)),
                             );
                             Type::Error
@@ -2154,13 +2157,25 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
             let mut rewriter =
                 ExpRewriter::new(self.parent.env, &mut replacer).set_type_args(type_arguments);
             let mut exp = rewriter.rewrite(exp);
-            let additional_exps = rewriter.rewrite_vec(additional_exps);
+            let mut additional_exps = rewriter.rewrite_vec(additional_exps);
             if let Some(cond) = &path_cond {
                 // There is a path condition to be added. This is only possible for proper
                 // boolean conditions.
                 if kind.get_spec_var_target().is_some() {
                     self.parent
                         .error(loc, &format!("`{}` cannot be included conditionally", kind));
+                } else if kind == &ConditionKind::Emits {
+                    let cond_exp = if additional_exps.len() < 2 {
+                        cond.clone()
+                    } else {
+                        self.make_path_expr(
+                            Operation::And,
+                            cond.node_id(),
+                            cond.clone(),
+                            additional_exps.pop().unwrap(),
+                        )
+                    };
+                    additional_exps.push(cond_exp);
                 } else {
                     // In case of AbortsIf, the path condition is combined with the predicate using
                     // &&, otherwise ==>.
@@ -2227,17 +2242,12 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
     }
 
     /// Extends a path condition for schema expression analysis.
-    fn extend_path_condition(
-        &mut self,
-        loc: &Loc,
-        path_cond: Option<Exp>,
-        exp: Exp,
-    ) -> Option<Exp> {
+    fn extend_path_condition(&mut self, loc: &Loc, path_cond: Option<Exp>, exp: Exp) -> Exp {
         if let Some(cond) = path_cond {
             let node_id = self.parent.env.new_node(loc.clone(), BOOL_TYPE.clone());
-            Some(Exp::Call(node_id, Operation::And, vec![cond, exp]))
+            Exp::Call(node_id, Operation::And, vec![cond, exp])
         } else {
-            Some(exp)
+            exp
         }
     }
 
@@ -2397,6 +2407,14 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                     if is_public {
                         return false;
                     }
+                }
+                PA::FunctionVisibility::Script(..) => {
+                    // TODO: model script visibility properly
+                    unimplemented!("Script visibility not supported yet")
+                }
+                PA::FunctionVisibility::Friend(..) => {
+                    // TODO: model friend visibility properly
+                    unimplemented!("Friend visibility not supported yet")
                 }
             }
         }

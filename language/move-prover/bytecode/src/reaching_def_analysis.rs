@@ -10,7 +10,7 @@ use crate::{
     dataflow_analysis::{AbstractDomain, DataflowAnalysis, JoinResult, TransferFunctions},
     function_target::{FunctionData, FunctionTarget},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder},
-    stackless_bytecode::{BorrowNode, Bytecode, Operation},
+    stackless_bytecode::{AbortAction, BorrowNode, Bytecode, Operation},
     stackless_control_flow_graph::StacklessControlFlowGraph,
 };
 use itertools::Itertools;
@@ -30,24 +30,13 @@ pub enum Def {
 #[derive(Default)]
 pub struct ReachingDefAnnotation(BTreeMap<CodeOffset, BTreeMap<TempIndex, BTreeSet<Def>>>);
 
-pub struct ReachingDefProcessor {
-    /// If true, user locals will not be renamed during copy propagation.
-    preserve_user_locals: bool,
-}
+pub struct ReachingDefProcessor {}
 
 type DefMap = BTreeMap<TempIndex, BTreeSet<Def>>;
 
 impl ReachingDefProcessor {
     pub fn new() -> Box<Self> {
-        Box::new(ReachingDefProcessor {
-            preserve_user_locals: true,
-        })
-    }
-
-    pub fn new_no_preserve_user_locals() -> Box<Self> {
-        Box::new(ReachingDefProcessor {
-            preserve_user_locals: false,
-        })
+        Box::new(ReachingDefProcessor {})
     }
 
     /// Returns Some(temp, def) if temp has a unique reaching definition and None otherwise.
@@ -103,22 +92,12 @@ impl ReachingDefProcessor {
         use Bytecode::*;
         code.iter()
             .filter_map(|bc| match bc {
-                Call(_, _, Operation::BorrowLoc, srcs) => Some(srcs[0]),
-                Call(_, _, Operation::WriteBack(BorrowNode::LocalRoot(src)), _) => Some(*src),
-                Call(_, _, Operation::WriteBack(BorrowNode::Reference(src)), _) => Some(*src),
+                Call(_, _, Operation::BorrowLoc, srcs, _) => Some(srcs[0]),
+                Call(_, _, Operation::WriteBack(BorrowNode::LocalRoot(src), _), ..) => Some(*src),
+                Call(_, _, Operation::WriteBack(BorrowNode::Reference(src), _), ..) => Some(*src),
                 _ => None,
             })
             .collect()
-    }
-
-    /// Determines whether code is suitable for copy propagation. Currently we cannot
-    /// do this for code with embedded spec blocks, because those refer to locals
-    /// which might be substituted via copy propagation.
-    /// TODO(wrwg): verify that spec blocks are the actual cause, it could be also a bug elsewhere.
-    ///     Currently functional/verify_vector fails without this and it uses spec blocks all
-    ///     over the place.
-    fn suitable_for_copy_propagation(&self, code: &[Bytecode]) -> bool {
-        !code.iter().any(|bc| matches!(bc, Bytecode::SpecBlock(..)))
     }
 }
 
@@ -129,14 +108,13 @@ impl FunctionTargetProcessor for ReachingDefProcessor {
         func_env: &FunctionEnv<'_>,
         mut data: FunctionData,
     ) -> FunctionData {
-        if func_env.is_native() || !self.suitable_for_copy_propagation(&data.code) {
+        if func_env.is_native() {
             // Nothing to do
             data
         } else {
             let cfg = StacklessControlFlowGraph::new_forward(&data.code);
             let analyzer = ReachingDefAnalysis {
-                target: FunctionTarget::new(func_env, &data),
-                preserve_user_locals: self.preserve_user_locals,
+                _target: FunctionTarget::new(func_env, &data),
                 borrowed_locals: self.borrowed_locals(&data.code),
             };
             let block_state_map = analyzer.analyze_function(
@@ -171,8 +149,7 @@ impl FunctionTargetProcessor for ReachingDefProcessor {
 }
 
 struct ReachingDefAnalysis<'a> {
-    target: FunctionTarget<'a>,
-    preserve_user_locals: bool,
+    _target: FunctionTarget<'a>,
     borrowed_locals: BTreeSet<TempIndex>,
 }
 
@@ -194,33 +171,24 @@ impl<'a> TransferFunctions for ReachingDefAnalysis<'a> {
         match instr {
             Assign(_, dest, src, _) => {
                 state.kill(*dest);
-                // On `self.preserve_user_locals`, only define aliases for temporaries.
-                // Also don't alias proxied parameters. The later is currently needed because the
-                // Boogie backend does not allow to write to such values, which happens via
-                // WriteBack instructions.
-                // TODO(refactoring): this can be removed once the old boogie backend is retired,
-                //   as in the new world, we emit `trace_local` instructions before this phase,
-                //   and this way remember user local names.
-                if !self.borrowed_locals.contains(dest)
-                    && (!self.preserve_user_locals
-                        || self.target.is_temporary(*dest)
-                            && self.target.get_proxy_index(*src).is_none())
-                {
+                if !self.borrowed_locals.contains(dest) && !self.borrowed_locals.contains(src) {
                     state.def_alias(*dest, *src);
                 }
             }
             Load(_, dest, ..) => {
                 state.kill(*dest);
             }
-            Call(_, dests, oper, ..) => {
-                if let WriteBack(LocalRoot(dest)) = oper {
+            Call(_, dests, oper, _, on_abort) => {
+                if let WriteBack(LocalRoot(dest), _) = oper {
                     state.kill(*dest);
                 }
                 for dest in dests {
                     state.kill(*dest);
                 }
+                if let Some(AbortAction(_, dest)) = on_abort {
+                    state.kill(*dest);
+                }
             }
-            OnAbort(_, _, code_dest) => state.kill(*code_dest),
             _ => {}
         }
     }

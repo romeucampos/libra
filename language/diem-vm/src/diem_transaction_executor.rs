@@ -6,14 +6,14 @@ use crate::{
     data_cache::StateViewCache,
     diem_transaction_validator::validate_signature_checked_transaction,
     diem_vm::{
-        charge_global_write_gas_usage, get_transaction_output,
-        txn_effects_to_writeset_and_events_cached, DiemVMImpl, DiemVMInternals,
+        charge_global_write_gas_usage, convert_changeset_and_events, get_transaction_output,
+        DiemVMImpl, DiemVMInternals,
     },
     errors::expect_only_successful_execution,
     logging::AdapterLogSchema,
     system_module_names::*,
     transaction_metadata::TransactionMetadata,
-    txn_effects_to_writeset_and_events, VMExecutor,
+    VMExecutor,
 };
 use diem_logger::prelude::*;
 use diem_state_view::StateView;
@@ -359,9 +359,9 @@ impl DiemVM {
                     .and_then(|_| tmp_session.finish())
                     .map_err(|e| e.into_vm_status());
                 match execution_result {
-                    Ok(effect) => {
+                    Ok((changeset, events)) => {
                         let (cs, events) =
-                            txn_effects_to_writeset_and_events(effect).map_err(Err)?;
+                            convert_changeset_and_events(changeset, events).map_err(Err)?;
                         ChangeSet::new(cs, events)
                     }
                     Err(e) => {
@@ -419,9 +419,10 @@ impl DiemVM {
             ))
         });
 
-        let mut txn_data = TransactionMetadata::default();
-        txn_data.sender = account_config::reserved_vm_address();
-
+        let txn_data = TransactionMetadata {
+            sender: account_config::reserved_vm_address(),
+            ..Default::default()
+        };
         let gas_schedule = zero_cost_schedule();
         let mut cost_strategy = CostStrategy::system(&gas_schedule, GasUnits::new(0));
         let mut session = self.0.new_session(remote_cache);
@@ -443,6 +444,7 @@ impl DiemVM {
                 &mut cost_strategy,
                 log_context,
             )
+            .map(|_return_vals| ())
             .or_else(|e| {
                 expect_only_successful_execution(e, BLOCK_PROLOGUE.as_str(), log_context)
             })?;
@@ -525,9 +527,8 @@ impl DiemVM {
             return Ok((e, discard_error_output(StatusCode::INVALID_WRITE_SET)));
         };
 
-        let effects = session.finish().map_err(|e| e.into_vm_status())?;
-        let (epilogue_writeset, epilogue_events) =
-            txn_effects_to_writeset_and_events_cached(&mut (), effects)?;
+        let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
+        let (epilogue_writeset, epilogue_events) = convert_changeset_and_events(changeset, events)?;
 
         // Make sure epilogue WriteSet doesn't intersect with the writeset in TransactionPayload.
         if !epilogue_writeset

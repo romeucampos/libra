@@ -4,18 +4,20 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    boogie_wrapper::BoogieWrapper,
-    bytecode_translator::BoogieTranslator,
     cli::{Options, INLINE_PRELUDE},
     prelude_template_helpers::StratificationHelper,
 };
 use abigen::Abigen;
 use anyhow::anyhow;
+use boogie_backend::{boogie_wrapper::BoogieWrapper, bytecode_translator::BoogieTranslator};
 use bytecode::{
+    data_invariant_instrumentation::DataInvariantInstrumentationProcessor,
     debug_instrumentation::DebugInstrumenter,
     function_target_pipeline::{FunctionTargetPipeline, FunctionTargetsHolder},
-    packed_types_analysis::PackedTypesProcessor,
-    spec_instrumentation::SpecInstrumenterProcessor,
+    global_invariant_instrumentation::GlobalInvariantInstrumentationProcessor,
+    global_invariant_instrumentation_v2::GlobalInvariantInstrumentationProcessorV2,
+    read_write_set_analysis::{self, ReadWriteSetProcessor},
+    spec_instrumentation::SpecInstrumentationProcessor,
 };
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream, WriteColor};
 use docgen::Docgen;
@@ -37,14 +39,9 @@ use std::{
     time::Instant,
 };
 
-mod boogie_helpers;
-mod boogie_wrapper;
-mod bytecode_translator;
 pub mod cli;
 mod pipelines;
 mod prelude_template_helpers;
-mod prover_task_runner;
-mod spec_translator;
 
 // =================================================================================================
 // Entry Point
@@ -61,6 +58,7 @@ pub fn run_move_prover<W: WriteColor>(
     let all_sources = collect_all_sources(
         &target_sources,
         &find_move_filenames(&options.move_deps, true)?,
+        options.inv_v2,
     )?;
     let other_sources = remove_sources(&target_sources, all_sources);
     let address = Some(options.account_address.as_ref());
@@ -88,7 +86,11 @@ pub fn run_move_prover<W: WriteColor>(
     }
     // Same for the error map generator
     if options.run_errmapgen {
-        return run_errmapgen(&env, &options, now);
+        return Ok(run_errmapgen(&env, &options, now));
+    }
+    // Same for read/write set analysis
+    if options.run_read_write_set {
+        return Ok(run_read_write_set(&env, &options, now));
     }
 
     let targets = create_and_process_bytecode(&options, &env);
@@ -108,18 +110,8 @@ pub fn run_move_prover<W: WriteColor>(
     }
     let writer = CodeWriter::new(env.internal_loc());
     add_prelude(&options, &writer)?;
-    if options.trans_v2 {
-        let mut translator = boogie_backend::bytecode_translator::BoogieTranslator::new(
-            &env,
-            &options.backend,
-            &targets,
-            &writer,
-        );
-        translator.translate();
-    } else {
-        let mut translator = BoogieTranslator::new(&env, &options, &targets, &writer);
-        translator.translate();
-    }
+    let mut translator = BoogieTranslator::new(&env, &options.backend, &targets, &writer);
+    translator.translate();
     if env.has_errors() {
         env.report_errors(error_writer);
         return Err(anyhow!("exiting with boogie generation errors"));
@@ -135,7 +127,7 @@ pub fn run_move_prover<W: WriteColor>(
             env: &env,
             targets: &targets,
             writer: &writer,
-            options: &options,
+            options: &options.backend,
             boogie_file_id,
         };
         boogie.call_boogie_and_verify_output(options.backend.bench_repeat, &options.output_path)?;
@@ -219,7 +211,7 @@ fn run_abigen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Resul
     Ok(())
 }
 
-fn run_errmapgen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Result<()> {
+fn run_errmapgen(env: &GlobalEnv, options: &Options, now: Instant) {
     let mut generator = ErrmapGen::new(env, &options.errmapgen);
     let checking_elapsed = now.elapsed();
     info!("generating error map");
@@ -231,7 +223,27 @@ fn run_errmapgen(env: &GlobalEnv, options: &Options, now: Instant) -> anyhow::Re
         checking_elapsed.as_secs_f64(),
         (generating_elapsed - checking_elapsed).as_secs_f64()
     );
-    Ok(())
+}
+
+fn run_read_write_set(env: &GlobalEnv, options: &Options, now: Instant) {
+    let mut targets = FunctionTargetsHolder::default();
+
+    for module_env in env.get_modules() {
+        for func_env in module_env.get_functions() {
+            targets.add_target(&func_env)
+        }
+    }
+    let mut pipeline = FunctionTargetPipeline::default();
+    pipeline.add_processor(ReadWriteSetProcessor::new());
+
+    let start = now.elapsed();
+    info!("generating read/write set");
+    pipeline.run(env, &mut targets, None);
+    read_write_set_analysis::get_read_write_set(env, &targets);
+    println!("generated for {:?}", options.move_sources);
+
+    let end = now.elapsed();
+    info!("{:.3}s analyzing", (end - start).as_secs_f64());
 }
 
 /// Adds the prelude to the generated output.
@@ -263,7 +275,7 @@ fn create_and_process_bytecode(options: &Options, env: &GlobalEnv) -> FunctionTa
     // Add function targets for all functions in the environment.
     for module_env in env.get_modules() {
         for func_env in module_env.get_functions() {
-            targets.add_target(&func_env, options.trans_v2)
+            targets.add_target(&func_env)
         }
     }
 
@@ -290,16 +302,18 @@ fn create_and_process_bytecode(options: &Options, env: &GlobalEnv) -> FunctionTa
 fn create_bytecode_processing_pipeline(options: &Options) -> FunctionTargetPipeline {
     let mut res = FunctionTargetPipeline::default();
     // Add processors in order they are executed.
-    if options.trans_v2 {
-        res.add_processor(DebugInstrumenter::new());
-    }
-    pipelines::pipelines(options.experimental_pipeline)
+
+    res.add_processor(DebugInstrumenter::new());
+    pipelines::pipelines(options)
         .into_iter()
         .for_each(|processor| res.add_processor(processor));
-    if options.trans_v2 {
-        res.add_processor(SpecInstrumenterProcessor::new());
+    res.add_processor(SpecInstrumentationProcessor::new());
+    res.add_processor(DataInvariantInstrumentationProcessor::new());
+    if options.inv_v2 {
+        // *** convert to v2 version ***
+        res.add_processor(GlobalInvariantInstrumentationProcessorV2::new());
     } else {
-        res.add_processor(PackedTypesProcessor::new());
+        res.add_processor(GlobalInvariantInstrumentationProcessor::new());
     }
     res
 }
@@ -323,10 +337,13 @@ fn remove_sources(sources: &[String], all_files: Vec<String>) -> Vec<String> {
 fn collect_all_sources(
     target_sources: &[String],
     input_deps: &[String],
+    use_inv_v2: bool,
 ) -> anyhow::Result<Vec<String>> {
     let mut all_sources = target_sources.to_vec();
     static DEP_REGEX: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"(?m)use\s*0x[0-9abcdefABCDEF]+::\s*(\w+)").unwrap());
+    static NEW_FRIEND_REGEX: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)friend\s*0x[0-9abcdefABCDEF]+::\s*(\w+)").unwrap());
     static FRIEND_REGEX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"(?m)pragma\s*friend\s*=\s*0x[0-9abcdefABCDEF]+::\s*(\w+)").unwrap()
     });
@@ -334,7 +351,16 @@ fn collect_all_sources(
     let target_deps = calculate_deps(&all_sources, input_deps, &DEP_REGEX)?;
     all_sources.extend(target_deps);
 
-    let friend_sources = calculate_deps(&all_sources, input_deps, &FRIEND_REGEX)?;
+    let friend_sources = calculate_deps(
+        &all_sources,
+        input_deps,
+        if use_inv_v2 {
+            &NEW_FRIEND_REGEX
+        } else {
+            &FRIEND_REGEX
+        },
+    )?;
+
     all_sources.extend(friend_sources);
 
     let friend_deps = calculate_deps(&all_sources, input_deps, &DEP_REGEX)?;

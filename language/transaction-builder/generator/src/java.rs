@@ -122,7 +122,7 @@ fn prepare_doc_string(doc: &str) -> String {
     // Replace subsection titles.
     let doc = regex::Regex::new("##* (.*)\n")
         .unwrap()
-        .replace_all(&doc, "<p><b>$1</b>\n");
+        .replace_all(&doc, "<p><b>$1</b></p>\n");
     // Simulate lists.
     let doc = regex::Regex::new("\n\\* (.*)")
         .unwrap()
@@ -431,7 +431,7 @@ private static {} decode_{}_argument(TransactionArgument arg) {{
         }
         doc = format!("{}\n@return {}", doc, return_doc);
         let text = textwrap::indent(&doc, " * ").replace("\n\n", "\n *\n");
-        format!("/**\n{} */\n", text)
+        format!("/**\n{}\n */\n", text)
     }
 
     fn quote_type_arguments(ty_args: &[TypeArgumentABI]) -> String {

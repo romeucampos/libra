@@ -10,7 +10,7 @@ use crate::{
     keygen::KeyGen,
 };
 use compiled_stdlib::{
-    stdlib_modules, transaction_scripts::StdlibScript, StdLibModules, StdLibOptions,
+    legacy::transaction_scripts::LegacyStdlibScript, stdlib_modules, StdLibModules, StdLibOptions,
 };
 use diem_crypto::HashValue;
 use diem_state_view::StateView;
@@ -26,8 +26,8 @@ use diem_types::{
     write_set::WriteSet,
 };
 use diem_vm::{
-    data_cache::RemoteStorage, txn_effects_to_writeset_and_events, DiemVM, DiemVMValidator,
-    VMExecutor, VMValidator,
+    convert_changeset_and_events, data_cache::RemoteStorage, DiemVM, DiemVMValidator, VMExecutor,
+    VMValidator,
 };
 use move_core_types::{
     gas_schedule::{GasAlgebra, GasUnits},
@@ -77,7 +77,7 @@ impl FakeExecutor {
         Self::custom_genesis(
             stdlib_modules(StdLibOptions::Compiled).bytes_opt.unwrap(),
             None,
-            VMPublishingOption::locked(StdlibScript::allowlist()),
+            VMPublishingOption::locked(LegacyStdlibScript::allowlist()),
         )
     }
 
@@ -107,7 +107,10 @@ impl FakeExecutor {
     }
 
     pub fn set_golden_file(&mut self, test_name: &str) {
-        self.executed_output = Some(GoldenOutputs::new(test_name));
+        // 'test_name' includes ':' in the names, lets re-write these to be '_'s so that these
+        // files can persist on windows machines.
+        let file_name = test_name.replace(':', "_");
+        self.executed_output = Some(GoldenOutputs::new(&file_name));
     }
 
     /// Creates an executor with only the standard library Move modules published and not other
@@ -366,9 +369,9 @@ impl FakeExecutor {
                         e.into_vm_status()
                     )
                 });
-            let effects = session.finish().expect("Failed to generate txn effects");
-            let (writeset, _events) =
-                txn_effects_to_writeset_and_events(effects).expect("Failed to generate writeset");
+            let (changeset, events) = session.finish().expect("Failed to generate txn effects");
+            let (writeset, _events) = convert_changeset_and_events(changeset, events)
+                .expect("Failed to generate writeset");
             writeset
         };
         self.data_store.add_write_set(&write_set);
@@ -397,9 +400,9 @@ impl FakeExecutor {
                 &log_context,
             )
             .map_err(|e| e.into_vm_status())?;
-        let effects = session.finish().expect("Failed to generate txn effects");
+        let (changeset, events) = session.finish().expect("Failed to generate txn effects");
         let (writeset, _events) =
-            txn_effects_to_writeset_and_events(effects).expect("Failed to generate writeset");
+            convert_changeset_and_events(changeset, events).expect("Failed to generate writeset");
         Ok(writeset)
     }
 }

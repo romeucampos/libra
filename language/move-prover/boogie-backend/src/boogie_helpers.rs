@@ -4,9 +4,10 @@
 //! Helpers for emitting Boogie code.
 
 use crate::options::BoogieOptions;
+use bytecode::function_target::FunctionTarget;
 use itertools::Itertools;
 use move_model::{
-    ast::MemoryLabel,
+    ast::{MemoryLabel, TempIndex},
     model::{
         FieldEnv, FunctionEnv, GlobalEnv, ModuleEnv, ModuleId, QualifiedId, SpecFunId, StructEnv,
         StructId, SCRIPT_MODULE_NAME,
@@ -108,6 +109,7 @@ pub fn boogie_type_value(env: &GlobalEnv, ty: &Type) -> String {
             PrimitiveType::Signer => "$AddressType()".to_string(),
             PrimitiveType::Range => "$RangeType()".to_string(),
             PrimitiveType::TypeValue => "$TypeType()".to_string(),
+            PrimitiveType::EventStore => unimplemented!("EventStore"),
         },
         Type::Vector(t) => format!("$Vector_type_value({})", boogie_type_value(env, t)),
         Type::Reference(_, t) => format!("ReferenceType({})", boogie_type_value(env, t)),
@@ -121,7 +123,7 @@ pub fn boogie_type_value(env: &GlobalEnv, ty: &Type) -> String {
         Type::Fun(_args, _result) => "Function_type_value()".to_string(),
         Type::Error => panic!("unexpected error type"),
         Type::Var(..) => panic!("unexpected type variable"),
-        Type::TypeDomain(..) => panic!("unexpected transient type"),
+        Type::TypeDomain(..) | Type::ResourceDomain(..) => panic!("unexpected transient type"),
     }
 }
 
@@ -228,6 +230,7 @@ fn boogie_well_formed_expr_impl(env: &GlobalEnv, name: &str, ty: &Type, nest: us
             PrimitiveType::Signer => add_type_check(format!("is#$Address({})", name)),
             PrimitiveType::Range => add_type_check(format!("$IsValidRange({})", name)),
             PrimitiveType::TypeValue => add_type_check(format!("is#$Type({})", name)),
+            PrimitiveType::EventStore => unimplemented!("EventStore"),
         },
         Type::Vector(elem_ty) => {
             add_type_check(format!("$Vector_$is_well_formed({})", name));
@@ -265,7 +268,9 @@ fn boogie_well_formed_expr_impl(env: &GlobalEnv, name: &str, ty: &Type, nest: us
         Type::Tuple(_elems) => {}
         // A type parameter or type value is opaque, so no type check here.
         Type::TypeParameter(..) | Type::TypeLocal(..) => {}
-        Type::Error | Type::Var(..) | Type::TypeDomain(..) => panic!("unexpected transient type"),
+        Type::Error | Type::Var(..) | Type::TypeDomain(..) | Type::ResourceDomain(..) => {
+            panic!("unexpected transient type")
+        }
     }
     conds.iter().filter(|s| !s.is_empty()).join(" && ")
 }
@@ -342,30 +347,59 @@ pub fn boogie_byte_blob(options: &BoogieOptions, val: &[u8]) -> String {
         for (i, b) in val.iter().enumerate() {
             ctor_expr = format!("{}[{} := $Integer({})]", ctor_expr, i, *b);
         }
-        format!("$Vector($ValueArray({}, {}))", ctor_expr, val.len())
+        format!("$ValueArray({}, {})", ctor_expr, val.len())
     }
 }
 
 /// Construct a statement to debug track a local based on the Boogie attribute approach.
-pub fn boogie_debug_track_local_via_attrib(
-    file_idx: &str,
-    pos: &str,
-    var_idx: &str,
+pub fn boogie_debug_track_local(
+    fun_target: &FunctionTarget<'_>,
+    var_idx: TempIndex,
     value: &str,
 ) -> String {
+    let fun_def_idx = fun_target.func_env.get_def_idx();
     ensure_trace_info(format!(
         "$trace_local_temp := {};\n\
         assume {{:print \"$track_local({},{},{}):\", $trace_local_temp}} {} == {};",
-        value, file_idx, pos, var_idx, value, value,
+        value,
+        fun_target.func_env.module_env.get_id().to_usize(),
+        fun_def_idx,
+        var_idx,
+        value,
+        value,
     ))
 }
 
-/// Construct a statement to debug track an abort using the Boogie attribute approach.
-pub fn boogie_debug_track_abort_via_attrib(file_idx: &str, pos: &str, abort_code: &str) -> String {
+/// Construct a statement to debug track an abort.
+pub fn boogie_debug_track_abort(fun_target: &FunctionTarget<'_>, abort_code: &str) -> String {
+    let fun_def_idx = fun_target.func_env.get_def_idx();
     ensure_trace_info(format!(
         "$trace_abort_temp := i#$Integer({});\n\
         assume {{:print \"$track_abort({},{}):\", $trace_abort_temp}} {} == {};",
-        abort_code, file_idx, pos, abort_code, abort_code
+        abort_code,
+        fun_target.func_env.module_env.get_id().to_usize(),
+        fun_def_idx,
+        abort_code,
+        abort_code
+    ))
+}
+
+/// Construct a statement to debug track a return value.
+pub fn boogie_debug_track_return(
+    fun_target: &FunctionTarget<'_>,
+    ret_idx: usize,
+    value: &str,
+) -> String {
+    let fun_def_idx = fun_target.func_env.get_def_idx();
+    ensure_trace_info(format!(
+        "$trace_local_temp := {};\n\
+        assume {{:print \"$track_return({},{},{}):\", $trace_local_temp}} {} == {};",
+        value,
+        fun_target.func_env.module_env.get_id().to_usize(),
+        fun_def_idx,
+        ret_idx,
+        value,
+        value,
     ))
 }
 
@@ -374,6 +408,6 @@ pub fn boogie_debug_track_abort_via_attrib(file_idx: &str, pos: &str, abort_code
 /// let our tracking statements above not be forgotten, this trick ensures that they always
 /// appear in the trace.
 fn ensure_trace_info(s: String) -> String {
-    format!("if (true) {{\n   {}\n}}", s.replace("\n", "\n   "))
-    //s
+    //format!("if (true) {{\n   {}\n}}", s.replace("\n", "\n   "))
+    s
 }

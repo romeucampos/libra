@@ -22,7 +22,7 @@ pub enum JoinResult {
 }
 
 impl JoinResult {
-    pub fn join(self, other: JoinResult) -> JoinResult {
+    pub fn combine(self, other: JoinResult) -> JoinResult {
         use JoinResult::*;
         match (self, other) {
             (Unchanged, Unchanged) => Unchanged,
@@ -71,11 +71,34 @@ impl<E: Clone + Ord + Sized + Debug> AbstractDomain for SetDomain<E> {
     }
 }
 
+impl<E: Clone + Ord> std::iter::FromIterator<E> for SetDomain<E> {
+    fn from_iter<I: IntoIterator<Item = E>>(iter: I) -> Self {
+        let mut s = SetDomain::default();
+        for e in iter {
+            s.insert(e);
+        }
+        s
+    }
+}
+
+impl<E: Clone + Ord> std::iter::IntoIterator for SetDomain<E> {
+    type Item = E;
+    type IntoIter = std::collections::btree_set::IntoIter<E>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 impl<E: Clone + Ord + Sized> SetDomain<E> {
     pub fn singleton(e: E) -> Self {
         let mut s = SetDomain::default();
         s.insert(e);
         s
+    }
+
+    pub fn of_set(s: BTreeSet<E>) -> Self {
+        Self(s)
     }
 }
 
@@ -190,15 +213,14 @@ pub trait DataflowAnalysis: TransferFunctions {
             },
         );
         while let Some(block_id) = work_list.pop_front() {
-            let pre = state_map.remove(&block_id).expect("basic block").pre;
-            let post = self.execute_block(block_id, pre.clone(), &instrs, cfg);
+            let pre = state_map.get(&block_id).expect("basic block").pre.clone();
+            let post = self.execute_block(block_id, pre, &instrs, cfg);
 
             // propagate postcondition of this block to successor blocks
             for next_block_id in cfg.successors(block_id) {
                 match state_map.get_mut(next_block_id) {
                     Some(next_block_res) => {
                         let join_result = next_block_res.pre.join(&post);
-
                         match join_result {
                             JoinResult::Unchanged => {
                                 // Pre is the same after join. Reanalyzing this block would produce
@@ -225,7 +247,7 @@ pub trait DataflowAnalysis: TransferFunctions {
                     }
                 }
             }
-            state_map.insert(block_id, BlockState { pre, post });
+            state_map.get_mut(&block_id).expect("basic block").post = post;
         }
         state_map
     }

@@ -16,10 +16,10 @@ use std::{clone::Clone, collections::HashMap, hash::Hash};
 use vm::{
     access::ModuleAccess,
     file_format::{
-        AddressIdentifierIndex, CodeOffset, Constant, ConstantPoolIndex, FieldHandle,
+        AbilitySet, AddressIdentifierIndex, CodeOffset, Constant, ConstantPoolIndex, FieldHandle,
         FieldHandleIndex, FieldInstantiation, FieldInstantiationIndex, FunctionDefinitionIndex,
         FunctionHandle, FunctionHandleIndex, FunctionInstantiation, FunctionInstantiationIndex,
-        FunctionSignature, IdentifierIndex, Kind, ModuleHandle, ModuleHandleIndex, Signature,
+        FunctionSignature, IdentifierIndex, ModuleHandle, ModuleHandleIndex, Signature,
         SignatureIndex, SignatureToken, StructDefInstantiation, StructDefInstantiationIndex,
         StructDefinitionIndex, StructHandle, StructHandleIndex, TableIndex,
     },
@@ -230,7 +230,7 @@ pub struct MaterializedPools {
     pub identifiers: Vec<Identifier>,
     /// Address identifier pool
     pub address_identifiers: Vec<AccountAddress>,
-    /// Constnat pool
+    /// Constant pool
     pub constant_pool: Vec<Constant>,
 }
 
@@ -566,6 +566,13 @@ impl<'a> Context<'a> {
     // Declarations
     //**********************************************************************************************
 
+    /// Add a friend. This creates a module handle for the friended module.
+    pub fn declare_friend(&mut self, id: QualifiedModuleIdent) -> Result<ModuleHandle> {
+        let address = self.address_index(id.address)?;
+        let name = self.identifier_index(id.name.as_inner())?;
+        Ok(ModuleHandle { address, name })
+    }
+
     /// Add an import. This creates a module handle index for the imported module.
     pub fn declare_import(
         &mut self,
@@ -589,8 +596,17 @@ impl<'a> Context<'a> {
     pub fn declare_struct_handle_index(
         &mut self,
         sname: QualifiedStructIdent,
-        is_nominal_resource: bool,
-        type_parameters: Vec<Kind>,
+        abilities: AbilitySet,
+        type_parameters: Vec<AbilitySet>,
+    ) -> Result<StructHandleIndex> {
+        self.declare_struct_handle_index_with_abilities(sname, abilities, type_parameters)
+    }
+
+    fn declare_struct_handle_index_with_abilities(
+        &mut self,
+        sname: QualifiedStructIdent,
+        abilities: AbilitySet,
+        type_parameters: Vec<AbilitySet>,
     ) -> Result<StructHandleIndex> {
         let module = self.module_handle_index(&sname.module)?;
         let name = self.identifier_index(sname.name.as_inner())?;
@@ -599,7 +615,7 @@ impl<'a> Context<'a> {
             StructHandle {
                 module,
                 name,
-                is_nominal_resource,
+                abilities,
                 type_parameters,
             },
         );
@@ -709,7 +725,10 @@ impl<'a> Context<'a> {
         })
     }
 
-    fn dep_struct_handle(&mut self, s: &QualifiedStructIdent) -> Result<(bool, Vec<Kind>)> {
+    fn dep_struct_handle(
+        &mut self,
+        s: &QualifiedStructIdent,
+    ) -> Result<(AbilitySet, Vec<AbilitySet>)> {
         if s.module.as_inner() == ModuleName::self_name() {
             bail!("Unbound struct {}", s)
         }
@@ -717,7 +736,7 @@ impl<'a> Context<'a> {
         let dep = self.dependency(&mident)?;
         match dep.struct_handle(&mident.name, &s.name) {
             None => bail!("Unbound struct {}", s),
-            Some(shandle) => Ok((shandle.is_nominal_resource, shandle.type_parameters.clone())),
+            Some(shandle) => Ok((shandle.abilities, shandle.type_parameters.clone())),
         }
     }
 
@@ -728,8 +747,8 @@ impl<'a> Context<'a> {
         match self.structs.get(&s) {
             Some(sh) => Ok(StructHandleIndex(*self.struct_handles.get(sh).unwrap())),
             None => {
-                let (is_nominal_resource, type_parameters) = self.dep_struct_handle(&s)?;
-                self.declare_struct_handle_index(s, is_nominal_resource, type_parameters)
+                let (abilities, type_parameters) = self.dep_struct_handle(&s)?;
+                self.declare_struct_handle_index_with_abilities(s, abilities, type_parameters)
             }
         }
     }

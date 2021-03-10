@@ -2,21 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    config::{Error, RoleType, SecureBackend},
+    config::{Error, SecureBackend},
     keys::ConfigKey,
     network_id::NetworkId,
     utils,
 };
 use diem_crypto::{x25519, Uniform};
-use diem_network_address::NetworkAddress;
 use diem_network_address_encryption::Encryptor;
 use diem_secure_storage::{CryptoStorage, KVStorage, Storage};
-use diem_types::{transaction::authenticator::AuthenticationKey, PeerId};
+use diem_types::{
+    network_address::NetworkAddress, transaction::authenticator::AuthenticationKey, PeerId,
+};
 use rand::{
     rngs::{OsRng, StdRng},
     Rng, SeedableRng,
 };
 use serde::{Deserialize, Serialize};
+use short_hex_str::AsShortHexStr;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryFrom,
@@ -167,18 +169,26 @@ impl NetworkConfig {
         }
     }
 
-    pub fn load(&mut self, role: RoleType) -> Result<(), Error> {
+    /// Per convenience, so that NetworkId isn't needed to be specified for `validator_networks`
+    pub fn load_validator_network(&mut self) -> Result<(), Error> {
+        self.network_id = NetworkId::Validator;
+        self.load()
+    }
+
+    pub fn load_fullnode_network(&mut self) -> Result<(), Error> {
+        if self.network_id.is_validator_network() {
+            return Err(Error::InvariantViolation(format!(
+                "Set {} network for a non-validator network",
+                self.network_id
+            )));
+        }
+        self.load()
+    }
+
+    fn load(&mut self) -> Result<(), Error> {
         if self.listen_address.to_string().is_empty() {
             self.listen_address = utils::get_local_ip()
                 .ok_or_else(|| Error::InvariantViolation("No local IP".to_string()))?;
-        }
-
-        if role == RoleType::Validator {
-            self.network_id = NetworkId::Validator;
-        } else if self.network_id == NetworkId::Validator {
-            return Err(Error::InvariantViolation(
-                "Set NetworkId::Validator network for a non-validator network".to_string(),
-            ));
         }
 
         self.prepare_identity();
@@ -207,11 +217,13 @@ impl NetworkConfig {
             Identity::None => {
                 let mut rng = StdRng::from_seed(OsRng.gen());
                 let key = x25519::PrivateKey::generate(&mut rng);
-                let peer_id = PeerId::from_identity_public_key(key.public_key());
+                let peer_id =
+                    diem_types::account_address::from_identity_public_key(key.public_key());
                 self.identity = Identity::from_config(key, peer_id);
             }
             Identity::FromConfig(config) => {
-                let peer_id = PeerId::from_identity_public_key(config.key.public_key());
+                let peer_id =
+                    diem_types::account_address::from_identity_public_key(config.key.public_key());
                 if config.peer_id == PeerId::ZERO {
                     config.peer_id = peer_id;
                 }
@@ -352,13 +364,17 @@ pub type PeerSet = HashMap<PeerId, Peer>;
 /// PreferredUpstream -> Always upstream, overriding any other discovery
 /// ValidatorFullNode -> Always upstream for incoming connections (including other ValidatorFullNodes)
 /// Upstream -> Upstream, if no ValidatorFullNode or PreferredUpstream.  Useful for initial seed discovery
+/// Downstream -> Downstream, defining a controlled downstream that I always want to connect
+/// Known -> A known peer, but it has no particular role assigned to it
 /// Unknown -> Undiscovered peer, likely due to a non-mutually authenticated connection always downstream
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PeerRole {
     Validator = 0,
     PreferredUpstream,
     ValidatorFullNode,
     Upstream,
+    Downstream,
+    Known,
     Unknown,
 }
 

@@ -1,8 +1,9 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::Error::UnexpectedError;
 use diem_types::transaction::Version;
+use futures::channel::{mpsc::SendError, oneshot::Canceled};
+use network::error::NetworkError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -16,8 +17,14 @@ pub enum Error {
     FullNodeSyncRequest,
     #[error("An integer overflow has occurred: {0}")]
     IntegerOverflow(String),
-    #[error("No peers are currently available!")]
-    NoAvailablePeers,
+    #[error("Received an invalid chunk request: {0}")]
+    InvalidChunkRequest(String),
+    #[error("Encountered a network error: {0}")]
+    NetworkError(String),
+    #[error("No peers are currently available: {0}")]
+    NoAvailablePeers(String),
+    #[error("No sync request was issued by consensus: {0}")]
+    NoSyncRequestFound(String),
     #[error("No transactions were committed, but received a commit notification!")]
     NoTransactionsCommitted,
     #[error("Received an old sync request for version {0}, but our known version is: {1}")]
@@ -36,6 +43,10 @@ pub enum Error {
     ReceivedEmptyChunk(String),
     #[error("Receivd a non-sequential chunk from {0}. Known version: {1}, received: {2}")]
     ReceivedNonSequentialChunk(String, String, String),
+    #[error("Received an unexpected chunk type: {0}")]
+    ReceivedWrongChunkType(String),
+    #[error("Received a oneshot::canceled event as the sender of a channel was dropped: {0}")]
+    SenderDroppedError(String),
     #[error("Synced beyond the target version. Synced version: {0}, target version: {1}")]
     SyncedBeyondTarget(Version, Version),
     #[error("State sync is uninitialized! Error: {0}")]
@@ -44,9 +55,20 @@ pub enum Error {
     UnexpectedError(String),
 }
 
-// TODO(joshlind): remove this once we move from anyhow error to thiserror in state sync!
-impl From<anyhow::Error> for Error {
-    fn from(error: anyhow::Error) -> Self {
-        UnexpectedError(format!("{}", error))
+impl From<NetworkError> for Error {
+    fn from(error: NetworkError) -> Self {
+        Error::NetworkError(error.to_string())
+    }
+}
+
+impl From<SendError> for Error {
+    fn from(error: SendError) -> Self {
+        Error::UnexpectedError(error.to_string())
+    }
+}
+
+impl From<Canceled> for Error {
+    fn from(canceled: Canceled) -> Self {
+        Error::SenderDroppedError(canceled.to_string())
     }
 }

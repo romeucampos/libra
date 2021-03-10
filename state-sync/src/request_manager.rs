@@ -8,7 +8,6 @@ use crate::{
     logging::{LogEntry, LogEvent, LogSchema},
     network::{StateSyncMessage, StateSyncSender},
 };
-use anyhow::{bail, format_err, Result};
 use diem_config::{
     config::{PeerNetworkId, UpstreamConfig},
     network_id::{NetworkId, NodeNetworkId},
@@ -74,6 +73,7 @@ enum PeerScoreUpdateType {
     // that a peer would first timeout and would then be punished with ChunkVersionCannotBeApplied.
     ChunkVersionCannotBeApplied,
     InvalidChunk,
+    InvalidChunkRequest,
     TimeOut,
 }
 
@@ -180,7 +180,9 @@ impl RequestManager {
                     let new_score = peer_info.score * 0.8;
                     peer_info.score = new_score.max(MIN_SCORE);
                 }
-                PeerScoreUpdateType::TimeOut | PeerScoreUpdateType::EmptyChunk => {
+                PeerScoreUpdateType::TimeOut
+                | PeerScoreUpdateType::EmptyChunk
+                | PeerScoreUpdateType::InvalidChunkRequest => {
                     let new_score = peer_info.score * 0.95;
                     peer_info.score = new_score.max(MIN_SCORE);
                 }
@@ -272,14 +274,16 @@ impl RequestManager {
         chosen_peers
     }
 
-    pub fn send_chunk_request(&mut self, req: GetChunkRequest) -> Result<()> {
+    pub fn send_chunk_request(&mut self, req: GetChunkRequest) -> Result<(), Error> {
         let log = LogSchema::new(LogEntry::SendChunkRequest).chunk_request(req.clone());
 
         // update internal state
         let peers = self.pick_peers();
         if peers.is_empty() {
             warn!(log.event(LogEvent::MissingPeers));
-            bail!("No peers to send chunk request to");
+            return Err(Error::NoAvailablePeers(
+                "No peers to send chunk request to".into(),
+            ));
         }
 
         let req_info = self.add_request(req.known_version, peers.clone());
@@ -292,16 +296,13 @@ impl RequestManager {
         let mut failed_peer_sends = vec![];
 
         for peer in peers {
-            let sender = self
-                .network_senders
-                .get_mut(&peer.network_id())
-                .expect("missing network sender for peer");
+            let mut sender = self.get_network_sender(&peer);
             let peer_id = peer.peer_id();
             let send_result = sender.send_to(peer_id, msg.clone());
             let curr_log = log.clone().peer(&peer);
             let result_label = if let Err(e) = send_result {
                 failed_peer_sends.push(peer.clone());
-                error!(curr_log.event(LogEvent::NetworkSendError).error(&e.into()));
+                error!(curr_log.event(LogEvent::NetworkSendError).error(&e));
                 counters::SEND_FAIL_LABEL
             } else {
                 debug!(curr_log.event(LogEvent::Success));
@@ -319,8 +320,32 @@ impl RequestManager {
         if failed_peer_sends.is_empty() {
             Ok(())
         } else {
-            bail!("Failed to send chunk request to: {:?}", failed_peer_sends)
+            Err(Error::UnexpectedError(format!(
+                "Failed to send chunk request to: {:?}",
+                failed_peer_sends
+            )))
         }
+    }
+
+    fn get_network_sender(&mut self, peer: &PeerNetworkId) -> StateSyncSender {
+        self.network_senders
+            .get_mut(&peer.network_id())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing network sender for network: {:?}",
+                    peer.network_id()
+                )
+            })
+            .clone()
+    }
+
+    pub fn send_chunk_response(
+        &mut self,
+        peer: &PeerNetworkId,
+        message: StateSyncMessage,
+    ) -> Result<(), Error> {
+        self.get_network_sender(peer)
+            .send_to(peer.peer_id(), message)
     }
 
     pub fn add_request(&mut self, version: u64, peers: Vec<PeerNetworkId>) -> ChunkRequestInfo {
@@ -335,15 +360,14 @@ impl RequestManager {
             prev_request.last_request_time = now;
             prev_request.clone()
         } else {
-            self.requests.insert(
-                version,
-                ChunkRequestInfo::new(version, peers, self.multicast_level),
-            );
-            self.requests
-                .get(&version)
-                .expect("missing chunk request that was just added")
-                .clone()
+            let chunk_request_info = ChunkRequestInfo::new(version, peers, self.multicast_level);
+            self.requests.insert(version, chunk_request_info.clone());
+            chunk_request_info
         }
+    }
+
+    pub fn process_chunk_from_downstream(&mut self, peer: &PeerNetworkId) {
+        self.update_score(&peer, PeerScoreUpdateType::InvalidChunk);
     }
 
     pub fn process_empty_chunk(&mut self, peer: &PeerNetworkId) {
@@ -352,6 +376,10 @@ impl RequestManager {
 
     pub fn process_invalid_chunk(&mut self, peer: &PeerNetworkId) {
         self.update_score(peer, PeerScoreUpdateType::InvalidChunk);
+    }
+
+    pub fn process_invalid_chunk_request(&mut self, peer: &PeerNetworkId) {
+        self.update_score(peer, PeerScoreUpdateType::InvalidChunkRequest);
     }
 
     pub fn process_success_response(&mut self, peer: &PeerNetworkId) {
@@ -379,8 +407,8 @@ impl RequestManager {
         synced_version: u64,
     ) -> Result<(), Error> {
         if self.is_multicast_response(chunk_version, peer) {
-            // This chunk response was in response to a past multicast response that another
-            // peer sent a response to earlier than this peer -- don't penalize!
+            // If the chunk is a stale multicast response (for a request that another peer sent
+            // a response to earlier) don't penalize the peer (no mismatch occurred -- it's just slow).
             Err(Error::ReceivedChunkForOutdatedRequest(
                 peer.to_string(),
                 synced_version.to_string(),
@@ -446,7 +474,7 @@ impl RequestManager {
 
     /// Checks whether the request sent with known_version = `version` has timed out
     /// Returns true if such a request timed out (or does not exist), else false.
-    pub fn has_request_timed_out(&mut self, version: u64) -> Result<bool> {
+    pub fn has_request_timed_out(&mut self, version: u64) -> Result<bool, Error> {
         let last_request_time = self.get_last_request_time(version).unwrap_or(UNIX_EPOCH);
 
         let timeout = is_timeout(last_request_time, self.request_timeout);
@@ -468,15 +496,15 @@ impl RequestManager {
         // increment multicast level if this request is also multicast-timed-out
         let multicast_start_time = self.get_multicast_start_time(version).unwrap_or(UNIX_EPOCH);
         if is_timeout(multicast_start_time, self.multicast_timeout) {
-            let new_multicast_level = std::cmp::min(
-                self.multicast_level
-                    .checked_add(1)
-                    .ok_or_else(|| format_err!("New multicast level has overflown!"))?,
-                self.upstream_config
-                    .upstream_count()
-                    .checked_sub(1)
-                    .ok_or_else(|| format_err!("Upstream count has overflown!"))?, // multicast_level (=network preference) is 0-indexed
-            );
+            let new_multicast_level = self.multicast_level.checked_add(1).ok_or_else(|| {
+                Error::IntegerOverflow("New multicast level has overflown!".into())
+            })?;
+            let max_multicast_level = self
+                .upstream_config
+                .upstream_count()
+                .checked_sub(1)
+                .ok_or_else(|| Error::IntegerOverflow("Upstream count has overflown!".into()))?; // multicast_level (=network preference) is 0-indexed
+            let new_multicast_level = std::cmp::min(new_multicast_level, max_multicast_level);
             self.update_multicast(new_multicast_level, Some(version));
         }
         Ok(timeout)
@@ -680,6 +708,32 @@ mod tests {
         // Process multiple invalid chunk responses from validator 0
         for _ in 0..NUM_CHUNKS_TO_PROCESS {
             request_manager.process_invalid_chunk(&validators[0]);
+        }
+
+        // Verify validator 0 is chosen less often than the other validators
+        verify_validator_picked_least_often(&mut request_manager, &validators, 0);
+    }
+
+    #[test]
+    fn test_score_invalid_chunk_request() {
+        let (mut request_manager, validators) = generate_request_manager_and_validators(10, 4);
+
+        // Process multiple invalid chunk requests from validator 0
+        for _ in 0..NUM_CHUNKS_TO_PROCESS {
+            request_manager.process_invalid_chunk_request(&validators[0]);
+        }
+
+        // Verify validator 0 is chosen less often than the other validators
+        verify_validator_picked_least_often(&mut request_manager, &validators, 0);
+    }
+
+    #[test]
+    fn test_score_chunk_from_downstream() {
+        let (mut request_manager, validators) = generate_request_manager_and_validators(10, 4);
+
+        // Process multiple chunk responses from downstream validator 0
+        for _ in 0..NUM_CHUNKS_TO_PROCESS {
+            request_manager.process_chunk_from_downstream(&validators[0]);
         }
 
         // Verify validator 0 is chosen less often than the other validators

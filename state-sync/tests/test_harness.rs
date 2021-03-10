@@ -1,7 +1,6 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{bail, format_err, Result};
 use channel::{diem_channel, message_queues::QueueStyle};
 use diem_config::{
     config::{NodeConfig, Peer, PeerRole, RoleType, HANDSHAKE_VERSION},
@@ -12,10 +11,6 @@ use diem_crypto::{
 };
 use diem_infallible::RwLock;
 use diem_mempool::mocks::MockSharedMempool;
-use diem_network_address::{
-    encrypted::{TEST_SHARED_VAL_NETADDR_KEY, TEST_SHARED_VAL_NETADDR_KEY_VERSION},
-    parse_memory, NetworkAddress, Protocol,
-};
 use diem_time_service::TimeService;
 use diem_types::{
     account_address::AccountAddress,
@@ -25,6 +20,10 @@ use diem_types::{
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    network_address::{
+        encrypted::{TEST_SHARED_VAL_NETADDR_KEY, TEST_SHARED_VAL_NETADDR_KEY_VERSION},
+        parse_memory, NetworkAddress, Protocol,
+    },
     on_chain_config::ValidatorSet,
     proof::TransactionListProof,
     test_helpers::transaction_test_helpers::get_test_signed_txn,
@@ -61,6 +60,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use state_sync::{
     bootstrapper::StateSyncBootstrapper,
     client::StateSyncClient,
+    error::Error,
     executor_proxy::ExecutorProxyTrait,
     network::{StateSyncEvents, StateSyncSender},
     shared_components::SyncState,
@@ -166,8 +166,9 @@ impl StateSyncPeer {
         for _ in 0..max_retries {
             let state = block_on(self.client.as_ref().unwrap().get_state()).unwrap();
             if state.synced_version() == target_version {
-                return highest_li_version
-                    .map_or(true, |li_version| li_version == state.committed_version());
+                return highest_li_version.map_or(true, |highest_li_version| {
+                    highest_li_version == state.committed_version()
+                });
             }
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
@@ -315,7 +316,7 @@ impl StateSyncEnvironment {
             MockExecutorProxy::new(handler, storage_proxy.clone()),
         );
 
-        peer.client = Some(bootstrapper.create_client());
+        peer.client = Some(bootstrapper.create_client(config.state_sync.client_commit_timeout_ms));
         peer.bootstrapper = Some(bootstrapper);
         peer.mempool = Some(MockSharedMempool::new(Some(mempool_requests)));
         peer.storage_proxy = Some(storage_proxy);
@@ -373,8 +374,8 @@ impl StateSyncEnvironment {
             let peer = self.peers[index].borrow();
             let auth_mode = AuthenticationMode::Mutual(peer.network_key.clone());
             let network_context = Arc::new(NetworkContext::new(
+                *role,
                 VALIDATOR_NETWORK.clone(),
-                RoleType::Validator,
                 peer.peer_id,
             ));
 
@@ -483,7 +484,7 @@ impl StateSyncEnvironment {
 }
 
 pub fn default_handler() -> MockRpcHandler {
-    Box::new(|resp| -> Result<TransactionListWithProof> { Ok(resp) })
+    Box::new(|resp| -> Result<TransactionListWithProof, Error> { Ok(resp) })
 }
 
 // Returns the initial peers with their signatures
@@ -666,9 +667,11 @@ impl MockStorage {
         )
     }
 
-    pub fn get_epoch_changes(&self, known_epoch: u64) -> Result<LedgerInfoWithSignatures> {
+    pub fn get_epoch_changes(&self, known_epoch: u64) -> Result<LedgerInfoWithSignatures, Error> {
         match self.ledger_infos.get(&known_epoch) {
-            None => bail!("[mock storage] missing epoch change li"),
+            None => Err(Error::UnexpectedError(
+                "Mock storage missing epoch change ledger info!".into(),
+            )),
             Some(li) => Ok(li.clone()),
         }
     }
@@ -802,18 +805,27 @@ impl MockStorage {
     }
 
     // Find LedgerInfo for an epoch boundary version.
-    pub fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+    pub fn get_epoch_ending_ledger_info(
+        &self,
+        version: u64,
+    ) -> Result<LedgerInfoWithSignatures, Error> {
         for li in self.ledger_infos.values() {
             if li.ledger_info().version() == version && li.ledger_info().ends_epoch() {
                 return Ok(li.clone());
             }
         }
-        bail!("No LedgerInfo found for version {}", version);
+        Err(Error::UnexpectedError(format!(
+            "No ledger info found for version: {:?}",
+            version
+        )))
     }
 }
 
 pub type MockRpcHandler = Box<
-    dyn Fn(TransactionListWithProof) -> Result<TransactionListWithProof> + Send + Sync + 'static,
+    dyn Fn(TransactionListWithProof) -> Result<TransactionListWithProof, Error>
+        + Send
+        + Sync
+        + 'static,
 >;
 
 pub struct MockExecutorProxy {
@@ -828,7 +840,7 @@ impl MockExecutorProxy {
 }
 
 impl ExecutorProxyTrait for MockExecutorProxy {
-    fn get_local_storage_state(&self) -> Result<SyncState> {
+    fn get_local_storage_state(&self) -> Result<SyncState, Error> {
         Ok(self.storage.read().get_local_storage_state())
     }
 
@@ -837,7 +849,7 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         txn_list_with_proof: TransactionListWithProof,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         self.storage.write().add_txns_with_li(
             txn_list_with_proof.transactions,
             ledger_info_with_sigs,
@@ -851,10 +863,10 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         known_version: u64,
         limit: u64,
         target_version: u64,
-    ) -> Result<TransactionListWithProof> {
+    ) -> Result<TransactionListWithProof, Error> {
         let start_version = known_version
             .checked_add(1)
-            .ok_or_else(|| format_err!("Known version too high"))?;
+            .ok_or_else(|| Error::IntegerOverflow("Known version has overflown!".into()))?;
         let txns = self
             .storage
             .read()
@@ -869,20 +881,26 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         (self.handler)(txns_with_proof)
     }
 
-    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_epoch_change_ledger_info(&self, epoch: u64) -> Result<LedgerInfoWithSignatures, Error> {
         self.storage.read().get_epoch_changes(epoch)
     }
 
-    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_epoch_ending_ledger_info(
+        &self,
+        version: u64,
+    ) -> Result<LedgerInfoWithSignatures, Error> {
         self.storage.read().get_epoch_ending_ledger_info(version)
     }
 
-    fn get_version_timestamp(&self, _version: u64) -> Result<u64> {
+    fn get_version_timestamp(&self, _version: u64) -> Result<u64, Error> {
         // Only used for logging purposes so no point in mocking
         Ok(0)
     }
 
-    fn publish_on_chain_config_updates(&mut self, _events: Vec<ContractEvent>) -> Result<()> {
+    fn publish_on_chain_config_updates(
+        &mut self,
+        _events: Vec<ContractEvent>,
+    ) -> Result<(), Error> {
         Ok(())
     }
 }
